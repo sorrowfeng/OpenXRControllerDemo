@@ -647,7 +647,6 @@ void ControllerDiagnosticDemo::AddMainDashboard() {
                                 .SetText("")
                                 .SetFontSize(24)
                                 .SetTextColor(0.02f, 0.02f, 0.02f, 1.0f)
-                                .NoScrollbar()
                                 .Build();
 
     const auto configure_nav_button = [&](int id, float r, float g, float b, float a, bool highlighted) {
@@ -2123,7 +2122,7 @@ void ControllerDiagnosticDemo::UpdateRuntimeState() {
                 controller_title = "目标选择";
                 hand_title = "推流控制";
                 mapping_title = "发送内容";
-                network_title = "扫描结果";
+                network_title = "全部设备";
                 runtime_body = Fmt("连接  %s\n发送  %s\n接口  %s\n本机  %s\n广播  %s",
                                    network_state_.interface_info.valid ? "已连接局域网" : "未连接局域网",
                                    (IsTriggerStreamingActive(Side::LEFT) || IsTriggerStreamingActive(Side::RIGHT))
@@ -2157,23 +2156,23 @@ void ControllerDiagnosticDemo::UpdateRuntimeState() {
                                         hand_states_[Side::RIGHT].active ? "online" : "offline");
                 {
                     std::ostringstream devices_stream;
-                    devices_stream << "设备清单\n";
-                    const size_t max_devices_to_show = std::min<size_t>(network_state_.discovered_devices.size(), 8);
-                    if (max_devices_to_show == 0) {
+                    if (network_state_.discovered_devices.empty()) {
                         devices_stream << "暂无设备";
                     } else {
-                        for (size_t index = 0; index < max_devices_to_show; ++index) {
-                            devices_stream << (index + 1) << ". "
-                                           << network_state_.discovered_devices[index].ip << "\n";
-                        }
-                        if (network_state_.discovered_devices.size() > max_devices_to_show) {
-                            devices_stream << "... 共 " << network_state_.discovered_devices.size() << " 台";
+                        for (size_t index = 0; index < network_state_.discovered_devices.size(); ++index) {
+                            const bool selected = static_cast<int>(index + 1) == network_state_.selected_target_index;
+                            devices_stream << (selected ? "> " : "  ")
+                                           << (index + 1) << ". "
+                                           << network_state_.discovered_devices[index].ip
+                                           << "  "
+                                           << network_state_.discovered_devices[index].mac
+                                           << "\n";
                         }
                     }
-                    mapping_right_body = devices_stream.str();
+                    network_body = devices_stream.str();
                 }
-                network_body = Fmt("联调步骤\n1. 扫描局域网\n2. 切换目标\n3. 发送一帧\n4. 再开持续 UDP\n"
-                                   "若列表太长，请用上下目标按钮切换，不必在此页完整展示所有详情。");
+                mapping_right_body = Fmt("联调步骤\n1. 扫描局域网\n2. 切换目标\n3. 发送一帧\n4. 再开持续 UDP\n"
+                                         "当前高亮目标会显示为 > 序号");
                 footer_hint = "网络页专门用于局域网扫描和 UDP 推流联调，先验证单帧，再开持续发送。";
                 break;
             case DashboardSection::Mapping:
