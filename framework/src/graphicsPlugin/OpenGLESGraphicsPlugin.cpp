@@ -16,6 +16,7 @@
 #include "SkyBox.h"
 #include "Cube.h"
 #include "GuiPlane.h"
+#include "ImGuiRenderer.h"
 #include "OpenGL/GLTexture.h"
 #include "GltfModel.h"
 
@@ -118,6 +119,11 @@ namespace PVRSampleFW {
                 this);
 
         InitializeGraphicsResources();
+
+        GuiGLContext guiContext{};
+        guiContext.display = window_.display;
+        guiContext.context = window_.context.context;
+        ImGuiRenderer::GetInstance()->Initialize(&guiContext);
     }
 
     void OpenGLESGraphicsPlugin::DebugMessageCallback(GLenum source, GLenum type, GLuint id, GLenum severity,
@@ -190,6 +196,7 @@ namespace PVRSampleFW {
 
     void OpenGLESGraphicsPlugin::ShutdownGraphicsDevice() {
         PLOGI("ShutdownGraphicsDevice");
+        ImGuiRenderer::GetInstance()->Shutdown();
         /// swapchain_framebuffer_
         if (swapchain_framebuffer_ != 0) {
             GL(glDeleteFramebuffers(1, &swapchain_framebuffer_));
@@ -256,6 +263,8 @@ namespace PVRSampleFW {
                                                       int64_t swapchainFormat, const std::vector<Scene> &scenes) {
         CHECK(layerView.subImage.imageArrayIndex == 0);  // Texture arrays not supported.
         UNUSED_PARM(swapchainFormat);                    // Not used in this function for now.
+
+        ImGuiRenderer::GetInstance()->TriggerSignal();
 
         glBindFramebuffer(GL_FRAMEBUFFER, swapchain_framebuffer_);
 

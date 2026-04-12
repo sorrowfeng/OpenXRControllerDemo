@@ -148,6 +148,21 @@ namespace PVRSampleFW {
         need_render_ = true;
     }
 
+    void GuiWindow::SetButtonCallback(int componentId, std::function<void()> callback) {
+        auto component = ValidateAndGetComponent(componentId);
+        if (component == nullptr) {
+            PLOGE("GuiWindow::SetButtonCallback componentId(%d) is invalid(not found)", componentId);
+            return;
+        }
+        if (component->componentType != GUI_WINDOW_COMPONENT_TYPE_BUTTON) {
+            PLOGE("GuiWindow::SetButtonCallback componentId(%d) is not a button", componentId);
+            return;
+        }
+
+        component->buttonCallback = std::move(callback);
+        need_render_ = true;
+    }
+
     void GuiWindow::SetComponentPos(int componentId, int posX, int posY) {
         auto component = ValidateAndGetComponent(componentId);
         if (component == nullptr) {

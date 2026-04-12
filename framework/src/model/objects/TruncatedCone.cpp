@@ -17,18 +17,27 @@
 
 namespace PVRSampleFW {
     void TruncatedCone::GenerateMesh(float r1, float r2, float h, int segments) {
-        int numVertices = (segments + 1) * 2;
-        int numindex = segments * 6;
-        vertex_buffer_.resize(numVertices * 6);
-        index_buffer_.resize(numindex);
-        const float angleStep = M_PI * 2.0f / segments;
-        const float kIvoryColor[] = {0.9f, 0.9f, 0.8f, 0.8f};
+        if (segments < 3) {
+            PLOGE("TruncatedCone::GenerateMesh requires at least 3 segments, got %d", segments);
+            vertex_buffer_.clear();
+            index_buffer_.clear();
+            return;
+        }
 
         struct Vertex {
             float x, y, z;
             float r, g, b, a;
         };
+
+        int numVertices = (segments + 1) * 2;
+        int numindex = segments * 6;
+        vertex_buffer_.resize((numVertices * sizeof(Vertex)) / sizeof(float));
+        index_buffer_.clear();
+        index_buffer_.reserve(numindex);
+        const float angleStep = M_PI * 2.0f / segments;
+        const float kIvoryColor[] = {0.9f, 0.9f, 0.8f, 0.8f};
         std::vector<Vertex> vertices;
+        vertices.reserve(numVertices);
 
         // bottom vertices
         for (int i = 0; i <= segments; ++i) {
@@ -52,14 +61,20 @@ namespace PVRSampleFW {
         std::memcpy(vertex_buffer_.data(), vertices.data(), vertices.size() * sizeof(Vertex));
 
         // index_buffer_ only for lateral
+        const uint32_t topBase = static_cast<uint32_t>(segments + 1);
         for (int i = 0; i < segments; ++i) {
-            index_buffer_.push_back(i);
-            index_buffer_.push_back(i + 1);
-            index_buffer_.push_back(segments + 2 + i);
+            const uint32_t bottom0 = static_cast<uint32_t>(i);
+            const uint32_t bottom1 = static_cast<uint32_t>(i + 1);
+            const uint32_t top0 = topBase + static_cast<uint32_t>(i);
+            const uint32_t top1 = topBase + static_cast<uint32_t>(i + 1);
 
-            index_buffer_.push_back(i + 1);
-            index_buffer_.push_back(segments + 2 + i);
-            index_buffer_.push_back(segments + 2 + (i + 1) % segments);
+            index_buffer_.push_back(bottom0);
+            index_buffer_.push_back(bottom1);
+            index_buffer_.push_back(top0);
+
+            index_buffer_.push_back(bottom1);
+            index_buffer_.push_back(top1);
+            index_buffer_.push_back(top0);
         }
 
         // Draw mode
@@ -70,7 +85,7 @@ namespace PVRSampleFW {
     }
 
     void TruncatedCone::GenerateMesh(float r1, float h, int segments, float slopeAngle) {
-        int r2 = r1 - h / tan(slopeAngle);
+        float r2 = r1 - h / tan(slopeAngle);
         GenerateMesh(r1, r2, h, segments);
     }
 

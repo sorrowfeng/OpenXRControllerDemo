@@ -259,6 +259,7 @@ namespace PVRSampleFW {
          * @param text A string describing the information.
          */
         void UpdateText(int componentId, const char* text);
+        void SetButtonCallback(int componentId, std::function<void()> callback);
 
         /**
          * Set component position with pixel

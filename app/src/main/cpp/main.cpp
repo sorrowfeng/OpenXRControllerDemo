@@ -261,7 +261,7 @@ namespace {
     }
 
     const char* HandLabel(int hand) {
-        return hand == Side::LEFT ? "Left Hand" : "Right Hand";
+        return hand == Side::LEFT ? "左手" : "右手";
     }
 
     std::string IpToString(uint32_t hostOrderIp) {
@@ -305,6 +305,14 @@ protected:
     bool CustomizedRender() override;
 
 private:
+    enum class DashboardSection {
+        Overview,
+        Controller,
+        Hand,
+        Network,
+        Mapping,
+    };
+
     struct HandTrackingState {
         XrHandEXT hand{XR_HAND_LEFT_EXT};
         XrHandTrackerEXT tracker{XR_NULL_HANDLE};
@@ -327,20 +335,29 @@ private:
     struct RobotHandMetrics {
         bool valid{false};
         bool spatial_valid{false};
-        bool thumb_side_valid{false};
-        bool thumb_bend_valid{false};
+        bool thumb_x_valid{false};
+        bool thumb_y_valid{false};
         bool index_bend_valid{false};
         bool middle_bend_valid{false};
         bool ring_bend_valid{false};
         bool little_bend_valid{false};
         XrVector3f palm_position{0.0f, 0.0f, 0.0f};
         XrVector3f index_tip_position{0.0f, 0.0f, 0.0f};
-        float thumb_side{0.0f};
-        float thumb_bend{0.0f};
+        float thumb_x{0.0f};
+        float thumb_y{0.0f};
         float index_bend{0.0f};
         float middle_bend{0.0f};
         float ring_bend{0.0f};
         float little_bend{0.0f};
+    };
+
+    struct HandCalibrationState {
+        bool pending{false};
+        bool countdown_started{false};
+        bool calibrated{false};
+        std::chrono::steady_clock::time_point countdown_start{};
+        RobotHandMetrics zero_metrics{};
+        std::string status{"未校准"};
     };
 
     struct LanDeviceInfo {
@@ -367,7 +384,7 @@ private:
         int socket_fd{-1};
         uint64_t packet_sequence{0};
         std::chrono::steady_clock::time_point last_send_time{};
-        std::string scan_status{"Idle"};
+        std::string scan_status{"空闲"};
         LanInterfaceInfo interface_info{};
         std::vector<LanDeviceInfo> discovered_devices{};
         mutable std::mutex device_mutex;
@@ -413,6 +430,16 @@ private:
     void ClearSpawnedCubes();
     void ResetPanelPose();
     void PulseController(int hand);
+    void SetDashboardSection(DashboardSection section);
+    void RefreshDashboardNavigation();
+    void ConfigureDashboardActionButton(int slot, const char* label, std::function<void()> callback,
+                                        float r, float g, float b, float a, bool dark_text);
+    void RefreshDashboardActionButtons();
+    void BeginHandCalibration();
+    void ClearHandCalibration();
+    void UpdateHandCalibration();
+    RobotHandMetrics ApplyCalibration(int hand, const RobotHandMetrics& raw_metrics) const;
+    std::string BuildCalibrationStatusText() const;
 
 private:
     PFN_xrCreateHandTrackerEXT xrCreateHandTrackerEXT_{nullptr};
@@ -424,7 +451,7 @@ private:
     bool hand_tracking_aim_enabled_{false};
     bool hand_tracking_source_supported_{false};
     bool hand_tracking_ready_{false};
-    std::string hand_tracking_create_error_{"not started"};
+    std::string hand_tracking_create_error_{"未开始"};
 
     std::array<HandTrackingState, Side::COUNT> hand_states_{
             HandTrackingState{XR_HAND_LEFT_EXT}, HandTrackingState{XR_HAND_RIGHT_EXT}};
@@ -454,17 +481,29 @@ private:
     std::shared_ptr<GuiPlane> network_plane_;
 
     int hero_summary_text_id_{-1};
+    int nav_overview_button_id_{-1};
+    int nav_controller_button_id_{-1};
+    int nav_hand_button_id_{-1};
+    int nav_network_button_id_{-1};
+    int nav_mapping_button_id_{-1};
+    std::array<int, 6> action_button_ids_{{-1, -1, -1, -1, -1, -1}};
     int left_controller_text_id_{-1};
     int right_controller_text_id_{-1};
     int left_hand_text_id_{-1};
     int right_hand_text_id_{-1};
     int event_text_id_{-1};
+    int runtime_title_text_id_{-1};
     int runtime_text_id_{-1};
+    int controller_title_text_id_{-1};
+    int mapping_title_text_id_{-1};
     int left_robot_mapping_text_id_{-1};
     int right_robot_mapping_text_id_{-1};
+    int network_title_text_id_{-1};
     int network_status_text_id_{-1};
+    int hand_title_text_id_{-1};
+    int footer_hint_text_id_{-1};
 
-    XrPosef dashboard_pose_{MakePose(0.0f, 0.24f, -1.18f)};
+    XrPosef dashboard_pose_{MakePose(0.0f, 0.06f, -1.18f)};
     XrPosef controller_pose_{MakePose(-0.52f, -0.18f, -1.26f)};
     XrPosef hand_pose_{MakePose(0.52f, -0.18f, -1.26f)};
     XrPosef action_pose_{MakePose(0.0f, -0.78f, -1.16f)};
@@ -472,11 +511,13 @@ private:
     XrPosef robot_mapping_pose_{MakePose(-0.88f, 0.36f, -1.56f)};
     XrPosef network_pose_{MakePose(0.0f, -0.12f, -1.72f)};
     std::vector<int64_t> spawned_cube_ids_;
-    std::string last_ui_event_{"Dashboard ready"};
+    std::string last_ui_event_{"控制台已就绪"};
     uint32_t previous_buttons_{0};
     uint32_t previous_touches_{0};
     std::array<bool, Side::COUNT> previous_index_pinch_{{false, false}};
+    std::array<HandCalibrationState, Side::COUNT> hand_calibration_states_{};
     NetworkStreamingState network_state_{};
+    DashboardSection dashboard_section_{DashboardSection::Overview};
 };
 
 ControllerDiagnosticDemo::ControllerDiagnosticDemo(const std::shared_ptr<Configurations>& appConfig)
@@ -529,9 +570,6 @@ bool ControllerDiagnosticDemo::CustomizedAppPostInit() {
     AddControllerVisuals();
     AddHandVisuals();
     AddMainDashboard();
-    AddRuntimePanel();
-    AddRobotMappingPanel();
-    AddNetworkPanel();
     InitializeNetworkStreaming();
     UpdateRuntimeState();
     return true;
@@ -541,6 +579,7 @@ bool ControllerDiagnosticDemo::CustomizedPreRenderFrame() {
     UpdateControllerVisuals();
     UpdateHandTracking();
     UpdateHandVisuals();
+    UpdateHandCalibration();
     DetectInputEvents();
     UpdateRuntimeState();
     UpdateNetworkStreaming();
@@ -592,96 +631,420 @@ void ControllerDiagnosticDemo::AddHandVisuals() {
 void ControllerDiagnosticDemo::AddMainDashboard() {
     auto& gui_scene = scenes_.at(SAMPLE_SCENE_TYPE_GUI);
 
-    GuiWindow::Builder hero_builder;
-    dashboard_window_ = hero_builder.SetSize(1240, 230)
-                                .SetBgColor(0.0f, 0.0f, 0.0f, 0.92f)
+    GuiWindow::Builder panel_builder;
+    dashboard_window_ = panel_builder.SetSize(1720, 1160)
+                                .SetBgColor(1.0f, 1.0f, 1.0f, 1.0f)
                                 .SetText("")
                                 .SetFontSize(24)
-                                .SetTextColor(1.0f, 1.0f, 1.0f, 1.0f)
+                                .SetTextColor(0.02f, 0.02f, 0.02f, 1.0f)
                                 .NoScrollbar()
                                 .Build();
-    hero_summary_text_id_ = dashboard_window_->AddText("OpenXR Input Studio", 42, 34);
-    dashboard_window_->SetComponentTextSize(hero_summary_text_id_, 36);
-    dashboard_window_->SetComponentTextColor(hero_summary_text_id_, 1.0f, 1.0f, 1.0f, 1.0f);
-    event_text_id_ = dashboard_window_->AddText("Recent event: waiting for first input", 42, 156);
-    dashboard_window_->SetComponentTextSize(event_text_id_, 16);
-    dashboard_window_->SetComponentTextColor(event_text_id_, 0.16f, 0.59f, 1.0f, 1.0f);
-    dashboard_plane_ = std::make_shared<GuiPlane>(dashboard_pose_, XrVector3f{1.54f, 0.30f, 1.0f}, dashboard_window_);
+
+    const auto configure_nav_button = [&](int id, float r, float g, float b, float a, bool highlighted) {
+        dashboard_window_->SetComponentSize(id, 164, 62);
+        dashboard_window_->SetComponentTextSize(id, 24);
+        dashboard_window_->SetComponentBgColor(id, r, g, b, a);
+        if (highlighted) {
+            dashboard_window_->SetComponentTextColor(id, 1.0f, 1.0f, 1.0f, 1.0f);
+        } else {
+            dashboard_window_->SetComponentTextColor(id, 0.20f, 0.28f, 0.38f, 1.0f);
+        }
+    };
+
+    const auto configure_action_button = [&](int id, int x, int y, float r, float g, float b, float a, bool dark_text) {
+        dashboard_window_->SetComponentPos(id, x, y);
+        dashboard_window_->SetComponentSize(id, 200, 62);
+        dashboard_window_->SetComponentTextSize(id, 22);
+        dashboard_window_->SetComponentBgColor(id, r, g, b, a);
+        if (dark_text) {
+            dashboard_window_->SetComponentTextColor(id, 0.18f, 0.22f, 0.28f, 1.0f);
+        } else {
+            dashboard_window_->SetComponentTextColor(id, 1.0f, 1.0f, 1.0f, 1.0f);
+        }
+    };
+
+    const int title_id = dashboard_window_->AddText("OpenXR 控制台", 232, 34);
+    dashboard_window_->SetComponentTextSize(title_id, 40);
+    dashboard_window_->SetComponentTextColor(title_id, 0.08f, 0.12f, 0.18f, 1.0f);
+
+    const int subtitle_id = dashboard_window_->AddText(
+            "单窗口设备控制台，集中显示手柄状态、手部追踪、灵巧手映射和局域网联调。", 232, 86);
+    dashboard_window_->SetComponentTextSize(subtitle_id, 22);
+    dashboard_window_->SetComponentTextColor(subtitle_id, 0.28f, 0.38f, 0.50f, 1.0f);
+
+    const int nav_brand = dashboard_window_->AddText("导航", 44, 42);
+    dashboard_window_->SetComponentTextSize(nav_brand, 24);
+    dashboard_window_->SetComponentTextColor(nav_brand, 0.16f, 0.26f, 0.40f, 1.0f);
+
+    nav_overview_button_id_ =
+            dashboard_window_->AddButton("总览", 36, 110, [&]() { SetDashboardSection(DashboardSection::Overview); });
+    configure_nav_button(nav_overview_button_id_, 0.22f, 0.56f, 0.96f, 1.0f, true);
+
+    nav_controller_button_id_ = dashboard_window_->AddButton(
+            "手柄", 36, 188, [&]() { SetDashboardSection(DashboardSection::Controller); });
+    configure_nav_button(nav_controller_button_id_, 0.86f, 0.90f, 0.96f, 1.0f, false);
+
+    nav_hand_button_id_ =
+            dashboard_window_->AddButton("手部", 36, 266, [&]() { SetDashboardSection(DashboardSection::Hand); });
+    configure_nav_button(nav_hand_button_id_, 0.86f, 0.90f, 0.96f, 1.0f, false);
+
+    nav_network_button_id_ =
+            dashboard_window_->AddButton("网络", 36, 344, [&]() { SetDashboardSection(DashboardSection::Network); });
+    configure_nav_button(nav_network_button_id_, 0.86f, 0.90f, 0.96f, 1.0f, false);
+
+    nav_mapping_button_id_ =
+            dashboard_window_->AddButton("映射", 36, 422, [&]() { SetDashboardSection(DashboardSection::Mapping); });
+    configure_nav_button(nav_mapping_button_id_, 0.86f, 0.90f, 0.96f, 1.0f, false);
+
+    const int nav_hint = dashboard_window_->AddText(
+            "左侧用于功能导航\n右侧显示实时状态\n整体风格：设备上位机", 42, 532);
+    dashboard_window_->SetComponentTextSize(nav_hint, 18);
+    dashboard_window_->SetComponentTextColor(nav_hint, 0.34f, 0.44f, 0.56f, 1.0f);
+
+    hero_summary_text_id_ = dashboard_window_->AddText("正在初始化运行时状态...", 232, 136);
+    dashboard_window_->SetComponentTextSize(hero_summary_text_id_, 28);
+    dashboard_window_->SetComponentTextColor(hero_summary_text_id_, 0.08f, 0.24f, 0.48f, 1.0f);
+
+    event_text_id_ = dashboard_window_->AddText("最近事件：等待输入", 232, 172);
+    dashboard_window_->SetComponentTextSize(event_text_id_, 20);
+    dashboard_window_->SetComponentTextColor(event_text_id_, 0.00f, 0.46f, 0.72f, 1.0f);
+
+    runtime_title_text_id_ = dashboard_window_->AddText("运行总览", 232, 238);
+    dashboard_window_->SetComponentTextSize(runtime_title_text_id_, 30);
+    dashboard_window_->SetComponentTextColor(runtime_title_text_id_, 0.08f, 0.12f, 0.18f, 1.0f);
+    runtime_text_id_ = dashboard_window_->AddText("等待运行时状态...", 232, 282);
+    dashboard_window_->SetComponentTextSize(runtime_text_id_, 22);
+    dashboard_window_->SetComponentTextColor(runtime_text_id_, 0.10f, 0.14f, 0.20f, 1.0f);
+
+    controller_title_text_id_ = dashboard_window_->AddText("手柄状态", 796, 238);
+    dashboard_window_->SetComponentTextSize(controller_title_text_id_, 30);
+    dashboard_window_->SetComponentTextColor(controller_title_text_id_, 0.08f, 0.12f, 0.18f, 1.0f);
+    left_controller_text_id_ = dashboard_window_->AddText("正在加载手柄数据...", 796, 282);
+    dashboard_window_->SetComponentTextSize(left_controller_text_id_, 22);
+    dashboard_window_->SetComponentTextColor(left_controller_text_id_, 0.10f, 0.14f, 0.20f, 1.0f);
+
+    mapping_title_text_id_ = dashboard_window_->AddText("灵巧手映射", 1288, 238);
+    dashboard_window_->SetComponentTextSize(mapping_title_text_id_, 30);
+    dashboard_window_->SetComponentTextColor(mapping_title_text_id_, 0.08f, 0.12f, 0.18f, 1.0f);
+    left_robot_mapping_text_id_ = dashboard_window_->AddText("正在准备左手映射...", 1288, 282);
+    dashboard_window_->SetComponentTextSize(left_robot_mapping_text_id_, 22);
+    dashboard_window_->SetComponentTextColor(left_robot_mapping_text_id_, 0.00f, 0.46f, 0.72f, 1.0f);
+    right_robot_mapping_text_id_ = dashboard_window_->AddText("正在准备右手映射...", 1288, 650);
+    dashboard_window_->SetComponentTextSize(right_robot_mapping_text_id_, 22);
+    dashboard_window_->SetComponentTextColor(right_robot_mapping_text_id_, 0.70f, 0.34f, 0.00f, 1.0f);
+
+    network_title_text_id_ = dashboard_window_->AddText("网络工具", 232, 626);
+    dashboard_window_->SetComponentTextSize(network_title_text_id_, 30);
+    dashboard_window_->SetComponentTextColor(network_title_text_id_, 0.08f, 0.12f, 0.18f, 1.0f);
+    network_status_text_id_ = dashboard_window_->AddText("正在准备网络接口...", 232, 670);
+    dashboard_window_->SetComponentTextSize(network_status_text_id_, 22);
+    dashboard_window_->SetComponentTextColor(network_status_text_id_, 0.10f, 0.14f, 0.20f, 1.0f);
+
+    hand_title_text_id_ = dashboard_window_->AddText("手部追踪", 796, 626);
+    dashboard_window_->SetComponentTextSize(hand_title_text_id_, 30);
+    dashboard_window_->SetComponentTextColor(hand_title_text_id_, 0.08f, 0.12f, 0.18f, 1.0f);
+    right_controller_text_id_ = dashboard_window_->AddText("正在加载手部数据...", 796, 670);
+    dashboard_window_->SetComponentTextSize(right_controller_text_id_, 22);
+    dashboard_window_->SetComponentTextColor(right_controller_text_id_, 0.10f, 0.14f, 0.20f, 1.0f);
+
+    footer_hint_text_id_ = dashboard_window_->AddText(
+            "建议流程：先确认输入状态，再扫描局域网、切换目标，最后开启 UDP 推流。", 232, 954);
+    dashboard_window_->SetComponentTextSize(footer_hint_text_id_, 20);
+    dashboard_window_->SetComponentTextColor(footer_hint_text_id_, 0.28f, 0.38f, 0.50f, 1.0f);
+
+    action_button_ids_[0] = dashboard_window_->AddButton("动作 1", 232, 1002, []() {});
+    configure_action_button(action_button_ids_[0], 232, 1002, 0.22f, 0.56f, 0.96f, 1.0f, false);
+    action_button_ids_[1] = dashboard_window_->AddButton("动作 2", 452, 1002, []() {});
+    configure_action_button(action_button_ids_[1], 452, 1002, 0.16f, 0.66f, 0.86f, 1.0f, false);
+    action_button_ids_[2] = dashboard_window_->AddButton("动作 3", 672, 1002, []() {});
+    configure_action_button(action_button_ids_[2], 672, 1002, 0.82f, 0.87f, 0.94f, 1.0f, true);
+    action_button_ids_[3] = dashboard_window_->AddButton("动作 4", 892, 1002, []() {});
+    configure_action_button(action_button_ids_[3], 892, 1002, 0.82f, 0.87f, 0.94f, 1.0f, true);
+    action_button_ids_[4] = dashboard_window_->AddButton("动作 5", 1112, 1002, []() {});
+    configure_action_button(action_button_ids_[4], 1112, 1002, 0.18f, 0.72f, 0.52f, 1.0f, false);
+    action_button_ids_[5] = dashboard_window_->AddButton("动作 6", 1332, 1002, []() {});
+    configure_action_button(action_button_ids_[5], 1332, 1002, 0.96f, 0.68f, 0.20f, 1.0f, true);
+
+    dashboard_plane_ = std::make_shared<GuiPlane>(dashboard_pose_, XrVector3f{1.72f, 1.12f, 1.0f}, dashboard_window_);
     dashboard_plane_->SetRenderDepthable(false);
     gui_scene.AddObject(dashboard_plane_);
 
-    GuiWindow::Builder controller_builder;
-    controller_window_ = controller_builder.SetSize(560, 720)
-                                 .SetBgColor(0.96f, 0.96f, 0.97f, 0.95f)
-                                 .SetText("")
-                                 .SetFontSize(20)
-                                 .SetTextColor(0.11f, 0.11f, 0.12f, 1.0f)
-                                 .NoScrollbar()
-                                 .Build();
-    const int controller_title = controller_window_->AddText("Controller Diagnostics", 26, 24);
-    controller_window_->SetComponentTextSize(controller_title, 28);
-    controller_window_->SetComponentTextColor(controller_title, 0.11f, 0.11f, 0.12f, 1.0f);
-    const int controller_caption = controller_window_->AddText(
-            "Grip + aim pose, analog input, battery, button and touch state.", 26, 74);
-    controller_window_->SetComponentTextSize(controller_caption, 16);
-    controller_window_->SetComponentTextColor(controller_caption, 0.0f, 0.0f, 0.0f, 0.80f);
-    left_controller_text_id_ = controller_window_->AddText("Loading left controller...", 26, 132);
-    controller_window_->SetComponentTextSize(left_controller_text_id_, 16);
-    controller_window_->SetComponentTextColor(left_controller_text_id_, 0.11f, 0.11f, 0.12f, 1.0f);
-    right_controller_text_id_ = controller_window_->AddText("Loading right controller...", 26, 408);
-    controller_window_->SetComponentTextSize(right_controller_text_id_, 16);
-    controller_window_->SetComponentTextColor(right_controller_text_id_, 0.11f, 0.11f, 0.12f, 1.0f);
-    controller_plane_ =
-            std::make_shared<GuiPlane>(controller_pose_, XrVector3f{0.78f, 0.98f, 1.0f}, controller_window_);
-    controller_plane_->SetRenderDepthable(false);
-    gui_scene.AddObject(controller_plane_);
+    RefreshDashboardNavigation();
+    RefreshDashboardActionButtons();
+}
 
-    GuiWindow::Builder hand_builder;
-    hand_window_ = hand_builder.SetSize(560, 720)
-                           .SetBgColor(0.11f, 0.11f, 0.12f, 0.93f)
-                           .SetText("")
-                           .SetFontSize(20)
-                           .SetTextColor(1.0f, 1.0f, 1.0f, 1.0f)
-                           .NoScrollbar()
-                           .Build();
-    const int hand_title = hand_window_->AddText("Hand Tracking Studio", 26, 24);
-    hand_window_->SetComponentTextSize(hand_title, 28);
-    hand_window_->SetComponentTextColor(hand_title, 1.0f, 1.0f, 1.0f, 1.0f);
-    const int hand_caption = hand_window_->AddText(
-            "Runtime hand joints, aim gesture, pinch strength, and live skeletal proxy.", 26, 74);
-    hand_window_->SetComponentTextSize(hand_caption, 16);
-    hand_window_->SetComponentTextColor(hand_caption, 1.0f, 1.0f, 1.0f, 0.78f);
-    left_hand_text_id_ = hand_window_->AddText("Loading left hand...", 26, 132);
-    hand_window_->SetComponentTextSize(left_hand_text_id_, 16);
-    hand_window_->SetComponentTextColor(left_hand_text_id_, 1.0f, 1.0f, 1.0f, 1.0f);
-    right_hand_text_id_ = hand_window_->AddText("Loading right hand...", 26, 408);
-    hand_window_->SetComponentTextSize(right_hand_text_id_, 16);
-    hand_window_->SetComponentTextColor(right_hand_text_id_, 1.0f, 1.0f, 1.0f, 1.0f);
-    hand_plane_ = std::make_shared<GuiPlane>(hand_pose_, XrVector3f{0.78f, 0.98f, 1.0f}, hand_window_);
-    hand_plane_->SetRenderDepthable(false);
-    gui_scene.AddObject(hand_plane_);
+void ControllerDiagnosticDemo::RefreshDashboardNavigation() {
+    if (dashboard_window_ == nullptr) {
+        return;
+    }
 
-    GuiWindow::Builder action_builder;
-    action_window_ = action_builder.SetSize(980, 118)
-                             .SetBgColor(0.0f, 0.0f, 0.0f, 0.88f)
-                             .SetText("")
-                             .SetFontSize(16)
-                             .SetTextColor(1.0f, 1.0f, 1.0f, 1.0f)
-                             .NoScrollbar()
-                             .Build();
-    const int center_button = action_window_->AddButton("Center Panels", 130, 34, [&]() { ResetPanelPose(); });
-    action_window_->SetComponentSize(center_button, 190, 48);
-    action_window_->SetComponentBgColor(center_button, 0.0f, 0.44f, 0.89f, 1.0f);
-    const int left_haptic = action_window_->AddButton("Left Haptic", 400, 34, [&]() { PulseController(Side::LEFT); });
-    action_window_->SetComponentSize(left_haptic, 170, 48);
-    action_window_->SetComponentBgColor(left_haptic, 0.0f, 0.44f, 0.89f, 1.0f);
-    const int right_haptic =
-            action_window_->AddButton("Right Haptic", 650, 34, [&]() { PulseController(Side::RIGHT); });
-    action_window_->SetComponentSize(right_haptic, 170, 48);
-    action_window_->SetComponentBgColor(right_haptic, 0.0f, 0.44f, 0.89f, 1.0f);
-    action_plane_ = std::make_shared<GuiPlane>(action_pose_, XrVector3f{1.16f, 0.16f, 1.0f}, action_window_);
-    action_plane_->SetRenderDepthable(false);
-    gui_scene.AddObject(action_plane_);
+    const auto apply_style = [&](int component_id, bool highlighted) {
+        if (component_id < 0) {
+            return;
+        }
+
+        if (highlighted) {
+            dashboard_window_->SetComponentBgColor(component_id, 0.22f, 0.56f, 0.96f, 1.0f);
+            dashboard_window_->SetComponentTextColor(component_id, 1.0f, 1.0f, 1.0f, 1.0f);
+        } else {
+            dashboard_window_->SetComponentBgColor(component_id, 0.86f, 0.90f, 0.96f, 1.0f);
+            dashboard_window_->SetComponentTextColor(component_id, 0.20f, 0.28f, 0.38f, 1.0f);
+        }
+    };
+
+    apply_style(nav_overview_button_id_, dashboard_section_ == DashboardSection::Overview);
+    apply_style(nav_controller_button_id_, dashboard_section_ == DashboardSection::Controller);
+    apply_style(nav_hand_button_id_, dashboard_section_ == DashboardSection::Hand);
+    apply_style(nav_network_button_id_, dashboard_section_ == DashboardSection::Network);
+    apply_style(nav_mapping_button_id_, dashboard_section_ == DashboardSection::Mapping);
+}
+
+void ControllerDiagnosticDemo::SetDashboardSection(DashboardSection section) {
+    dashboard_section_ = section;
+    RefreshDashboardNavigation();
+    RefreshDashboardActionButtons();
+
+    switch (section) {
+        case DashboardSection::Overview:
+            last_ui_event_ = "已切换到总览";
+            break;
+        case DashboardSection::Controller:
+            last_ui_event_ = "已切换到手柄页";
+            break;
+        case DashboardSection::Hand:
+            last_ui_event_ = "已切换到手部页";
+            break;
+        case DashboardSection::Network:
+            last_ui_event_ = "已切换到网络页";
+            break;
+        case DashboardSection::Mapping:
+            last_ui_event_ = "已切换到映射页";
+            break;
+    }
+}
+
+void ControllerDiagnosticDemo::ConfigureDashboardActionButton(int slot, const char* label, std::function<void()> callback,
+                                                             float r, float g, float b, float a, bool dark_text) {
+    if (dashboard_window_ == nullptr || slot < 0 || slot >= static_cast<int>(action_button_ids_.size())) {
+        return;
+    }
+
+    const int component_id = action_button_ids_[slot];
+    if (component_id < 0) {
+        return;
+    }
+
+    dashboard_window_->UpdateText(component_id, label);
+    dashboard_window_->SetButtonCallback(component_id, std::move(callback));
+    dashboard_window_->SetComponentBgColor(component_id, r, g, b, a);
+    dashboard_window_->SetComponentTextColor(component_id, dark_text ? 0.18f : 1.0f, dark_text ? 0.22f : 1.0f,
+                                             dark_text ? 0.28f : 1.0f, 1.0f);
+}
+
+void ControllerDiagnosticDemo::RefreshDashboardActionButtons() {
+    switch (dashboard_section_) {
+        case DashboardSection::Overview:
+            ConfigureDashboardActionButton(0, "面板居中", [&]() { ResetPanelPose(); }, 0.22f, 0.56f, 0.96f, 1.0f, false);
+            ConfigureDashboardActionButton(1, "扫描局域网", [&]() { StartLanScan(); }, 0.16f, 0.66f, 0.86f, 1.0f, false);
+            ConfigureDashboardActionButton(2, "左手震动", [&]() { PulseController(Side::LEFT); }, 0.72f, 0.80f, 0.96f, 1.0f, true);
+            ConfigureDashboardActionButton(3, "右手震动", [&]() { PulseController(Side::RIGHT); }, 0.72f, 0.80f, 0.96f, 1.0f, true);
+            ConfigureDashboardActionButton(4, "开始校准", [&]() { BeginHandCalibration(); }, 0.18f, 0.72f, 0.52f, 1.0f, false);
+            ConfigureDashboardActionButton(5, "发送一帧", [&]() {
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.send_snapshot_requested = true;
+                }
+                last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
+            }, 0.96f, 0.68f, 0.20f, 1.0f, true);
+            break;
+        case DashboardSection::Controller:
+            ConfigureDashboardActionButton(0, "左手震动", [&]() { PulseController(Side::LEFT); }, 0.22f, 0.56f, 0.96f, 1.0f, false);
+            ConfigureDashboardActionButton(1, "右手震动", [&]() { PulseController(Side::RIGHT); }, 0.16f, 0.66f, 0.86f, 1.0f, false);
+            ConfigureDashboardActionButton(2, "面板居中", [&]() { ResetPanelPose(); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
+            ConfigureDashboardActionButton(3, "开始校准", [&]() { BeginHandCalibration(); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
+            ConfigureDashboardActionButton(4, "切到网络", [&]() { SetDashboardSection(DashboardSection::Network); }, 0.18f, 0.72f, 0.52f, 1.0f, false);
+            ConfigureDashboardActionButton(5, "发送一帧", [&]() {
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.send_snapshot_requested = true;
+                }
+                last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
+            }, 0.96f, 0.68f, 0.20f, 1.0f, true);
+            break;
+        case DashboardSection::Hand:
+            ConfigureDashboardActionButton(0, "开始校准", [&]() { BeginHandCalibration(); }, 0.22f, 0.56f, 0.96f, 1.0f, false);
+            ConfigureDashboardActionButton(1, "清除校准", [&]() { ClearHandCalibration(); }, 0.16f, 0.66f, 0.86f, 1.0f, false);
+            ConfigureDashboardActionButton(2, "面板居中", [&]() { ResetPanelPose(); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
+            ConfigureDashboardActionButton(3, "切到映射", [&]() { SetDashboardSection(DashboardSection::Mapping); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
+            ConfigureDashboardActionButton(4, "扫描局域网", [&]() { StartLanScan(); }, 0.18f, 0.72f, 0.52f, 1.0f, false);
+            ConfigureDashboardActionButton(5, "发送一帧", [&]() {
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.send_snapshot_requested = true;
+                }
+                last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
+            }, 0.96f, 0.68f, 0.20f, 1.0f, true);
+            break;
+        case DashboardSection::Network:
+            ConfigureDashboardActionButton(0, "扫描局域网", [&]() { StartLanScan(); }, 0.22f, 0.56f, 0.96f, 1.0f, false);
+            ConfigureDashboardActionButton(1, "上个目标", [&]() { AdvanceSelectedLanTarget(-1); }, 0.16f, 0.66f, 0.86f, 1.0f, false);
+            ConfigureDashboardActionButton(2, "下个目标", [&]() { AdvanceSelectedLanTarget(1); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
+            ConfigureDashboardActionButton(3, "UDP 开关", [&]() {
+                bool udp_enabled = false;
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.udp_enabled = !network_state_.udp_enabled;
+                    udp_enabled = network_state_.udp_enabled;
+                }
+                last_ui_event_ = Fmt("UDP 推流已%s", udp_enabled ? "开启" : "关闭");
+            }, 0.82f, 0.87f, 0.94f, 1.0f, true);
+            ConfigureDashboardActionButton(4, "端口 +", [&]() {
+                uint16_t port = 0;
+                bool changed = false;
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    if (network_state_.udp_port < 65535) {
+                        ++network_state_.udp_port;
+                        port = network_state_.udp_port;
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    last_ui_event_ = Fmt("UDP 端口已设置为 %u", static_cast<unsigned int>(port));
+                }
+            }, 0.18f, 0.72f, 0.52f, 1.0f, false);
+            ConfigureDashboardActionButton(5, "发送一帧", [&]() {
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.send_snapshot_requested = true;
+                }
+                last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
+            }, 0.96f, 0.68f, 0.20f, 1.0f, true);
+            break;
+        case DashboardSection::Mapping:
+            ConfigureDashboardActionButton(0, "开始校准", [&]() { BeginHandCalibration(); }, 0.22f, 0.56f, 0.96f, 1.0f, false);
+            ConfigureDashboardActionButton(1, "清除校准", [&]() { ClearHandCalibration(); }, 0.16f, 0.66f, 0.86f, 1.0f, false);
+            ConfigureDashboardActionButton(2, "切到手部", [&]() { SetDashboardSection(DashboardSection::Hand); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
+            ConfigureDashboardActionButton(3, "扫描局域网", [&]() { StartLanScan(); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
+            ConfigureDashboardActionButton(4, "UDP 开关", [&]() {
+                bool udp_enabled = false;
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.udp_enabled = !network_state_.udp_enabled;
+                    udp_enabled = network_state_.udp_enabled;
+                }
+                last_ui_event_ = Fmt("UDP 推流已%s", udp_enabled ? "开启" : "关闭");
+            }, 0.18f, 0.72f, 0.52f, 1.0f, false);
+            ConfigureDashboardActionButton(5, "发送一帧", [&]() {
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.send_snapshot_requested = true;
+                }
+                last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
+            }, 0.96f, 0.68f, 0.20f, 1.0f, true);
+            break;
+    }
+}
+
+void ControllerDiagnosticDemo::BeginHandCalibration() {
+    for (int hand = 0; hand < Side::COUNT; ++hand) {
+        auto& calibration = hand_calibration_states_[hand];
+        calibration.pending = true;
+        calibration.countdown_started = false;
+        calibration.calibrated = false;
+        calibration.countdown_start = std::chrono::steady_clock::time_point{};
+        calibration.zero_metrics = RobotHandMetrics{};
+        calibration.status = "等待手势上线";
+    }
+    last_ui_event_ = "校准已启动，等待手势上线后 2 秒取零点";
+}
+
+void ControllerDiagnosticDemo::ClearHandCalibration() {
+    for (auto& calibration : hand_calibration_states_) {
+        calibration = HandCalibrationState{};
+    }
+    last_ui_event_ = "已清除手势校准零点";
+}
+
+void ControllerDiagnosticDemo::UpdateHandCalibration() {
+    const auto now = std::chrono::steady_clock::now();
+    for (int hand = 0; hand < Side::COUNT; ++hand) {
+        auto& calibration = hand_calibration_states_[hand];
+        if (!calibration.pending) {
+            if (calibration.calibrated) {
+                calibration.status = "已校准";
+            }
+            continue;
+        }
+
+        const RobotHandMetrics raw_metrics = ComputeRobotHandMetrics(hand);
+        const bool metrics_ready = raw_metrics.thumb_x_valid && raw_metrics.thumb_y_valid && raw_metrics.index_bend_valid &&
+                                   raw_metrics.middle_bend_valid && raw_metrics.ring_bend_valid &&
+                                   raw_metrics.little_bend_valid;
+        if (!hand_states_[hand].active || !metrics_ready) {
+            calibration.countdown_started = false;
+            calibration.countdown_start = std::chrono::steady_clock::time_point{};
+            calibration.status = "等待手势上线";
+            continue;
+        }
+
+        if (!calibration.countdown_started) {
+            calibration.countdown_started = true;
+            calibration.countdown_start = now;
+            calibration.status = "手势已上线，2 秒后校准";
+            continue;
+        }
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - calibration.countdown_start);
+        if (elapsed < std::chrono::seconds(2)) {
+            calibration.status = Fmt("校准倒计时 %.1f 秒", 2.0f - static_cast<float>(elapsed.count()) / 1000.0f);
+            continue;
+        }
+
+        calibration.pending = false;
+        calibration.countdown_started = false;
+        calibration.calibrated = true;
+        calibration.zero_metrics = raw_metrics;
+        calibration.status = "已校准";
+        last_ui_event_ = Fmt("%s校准完成", hand == Side::LEFT ? "左手" : "右手");
+    }
+}
+
+ControllerDiagnosticDemo::RobotHandMetrics ControllerDiagnosticDemo::ApplyCalibration(
+        int hand, const RobotHandMetrics& raw_metrics) const {
+    RobotHandMetrics adjusted = raw_metrics;
+    if (hand < 0 || hand >= Side::COUNT) {
+        return adjusted;
+    }
+
+    const auto& calibration = hand_calibration_states_[hand];
+    if (!calibration.calibrated) {
+        return adjusted;
+    }
+
+    const auto subtract_if_valid = [](bool value_valid, bool zero_valid, float value, float zero_value) {
+        return value_valid && zero_valid ? (value - zero_value) : value;
+    };
+
+    adjusted.thumb_x = subtract_if_valid(raw_metrics.thumb_x_valid, calibration.zero_metrics.thumb_x_valid,
+                                         raw_metrics.thumb_x, calibration.zero_metrics.thumb_x);
+    adjusted.thumb_y = subtract_if_valid(raw_metrics.thumb_y_valid, calibration.zero_metrics.thumb_y_valid,
+                                         raw_metrics.thumb_y, calibration.zero_metrics.thumb_y);
+    adjusted.index_bend = subtract_if_valid(raw_metrics.index_bend_valid, calibration.zero_metrics.index_bend_valid,
+                                            raw_metrics.index_bend, calibration.zero_metrics.index_bend);
+    adjusted.middle_bend = subtract_if_valid(raw_metrics.middle_bend_valid, calibration.zero_metrics.middle_bend_valid,
+                                             raw_metrics.middle_bend, calibration.zero_metrics.middle_bend);
+    adjusted.ring_bend = subtract_if_valid(raw_metrics.ring_bend_valid, calibration.zero_metrics.ring_bend_valid,
+                                           raw_metrics.ring_bend, calibration.zero_metrics.ring_bend);
+    adjusted.little_bend = subtract_if_valid(raw_metrics.little_bend_valid, calibration.zero_metrics.little_bend_valid,
+                                             raw_metrics.little_bend, calibration.zero_metrics.little_bend);
+    return adjusted;
+}
+
+std::string ControllerDiagnosticDemo::BuildCalibrationStatusText() const {
+    return Fmt("左手校准  %s\n右手校准  %s",
+               hand_calibration_states_[Side::LEFT].status.c_str(),
+               hand_calibration_states_[Side::RIGHT].status.c_str());
 }
 
 void ControllerDiagnosticDemo::AddRuntimePanel() {
@@ -825,24 +1188,31 @@ void ControllerDiagnosticDemo::AddNetworkPanel() {
 void ControllerDiagnosticDemo::InitializeNetworkStreaming() {
     ShutdownNetworkStreaming();
 
-    network_state_.packet_sequence = 0;
-    network_state_.udp_enabled = false;
-    network_state_.send_snapshot_requested = false;
-    network_state_.selected_target_index = 0;
-    network_state_.last_send_time = std::chrono::steady_clock::time_point{};
-    network_state_.interface_info = QueryLanInterface();
-    network_state_.scan_status =
-            network_state_.interface_info.valid ? "Interface ready" : "No active IPv4 LAN interface found";
+    const LanInterfaceInfo interface_info = QueryLanInterface();
+    std::string scan_status = interface_info.valid ? "接口就绪" : "未找到可用 IPv4 局域网接口";
 
     network_state_.socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (network_state_.socket_fd >= 0) {
         const int enabled = 1;
         setsockopt(network_state_.socket_fd, SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled));
     } else {
-        network_state_.scan_status = "Failed to create UDP socket";
+        scan_status = "UDP 套接字创建失败";
     }
 
-    if (network_state_.interface_info.valid) {
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        network_state_.packet_sequence = 0;
+        network_state_.udp_enabled = false;
+        network_state_.scan_in_progress = false;
+        network_state_.send_snapshot_requested = false;
+        network_state_.selected_target_index = 0;
+        network_state_.last_send_time = std::chrono::steady_clock::time_point{};
+        network_state_.interface_info = interface_info;
+        network_state_.scan_status = scan_status;
+        network_state_.discovered_devices.clear();
+    }
+
+    if (interface_info.valid) {
         StartLanScan();
     }
 }
@@ -852,19 +1222,28 @@ void ControllerDiagnosticDemo::ShutdownNetworkStreaming() {
         network_state_.scan_thread.join();
     }
 
-    if (network_state_.socket_fd >= 0) {
-        close(network_state_.socket_fd);
+    int socket_fd = -1;
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        socket_fd = network_state_.socket_fd;
         network_state_.socket_fd = -1;
+        network_state_.udp_enabled = false;
+        network_state_.scan_in_progress = false;
+        network_state_.send_snapshot_requested = false;
     }
 
-    network_state_.udp_enabled = false;
-    network_state_.scan_in_progress = false;
+    if (socket_fd >= 0) {
+        close(socket_fd);
+    }
 }
 
 void ControllerDiagnosticDemo::StartLanScan() {
-    if (network_state_.scan_in_progress) {
-        last_ui_event_ = "LAN scan already in progress";
-        return;
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        if (network_state_.scan_in_progress) {
+            last_ui_event_ = "局域网扫描正在进行中";
+            return;
+        }
     }
 
     if (network_state_.scan_thread.joinable()) {
@@ -872,21 +1251,24 @@ void ControllerDiagnosticDemo::StartLanScan() {
     }
 
     const LanInterfaceInfo interface_info = QueryLanInterface();
-    network_state_.interface_info = interface_info;
     if (!interface_info.valid) {
-        {
-            std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-            network_state_.discovered_devices.clear();
-        }
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        network_state_.interface_info = interface_info;
+        network_state_.discovered_devices.clear();
         network_state_.selected_target_index = 0;
-        network_state_.scan_status = "No active IPv4 LAN interface found";
-        last_ui_event_ = "LAN scan unavailable: no Wi-Fi or Ethernet IPv4 interface";
+        network_state_.scan_in_progress = false;
+        network_state_.scan_status = "未找到可用 IPv4 局域网接口";
+        last_ui_event_ = "无法扫描局域网：当前没有 Wi‑Fi 或以太网 IPv4 接口";
         return;
     }
 
-    network_state_.scan_in_progress = true;
-    network_state_.scan_status = Fmt("Scanning %s...", interface_info.interface_name.c_str());
-    last_ui_event_ = Fmt("Scanning subnet from %s", interface_info.local_ip.c_str());
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        network_state_.interface_info = interface_info;
+        network_state_.scan_in_progress = true;
+        network_state_.scan_status = Fmt("正在扫描 %s...", interface_info.interface_name.c_str());
+    }
+    last_ui_event_ = Fmt("正在从 %s 扫描子网", interface_info.local_ip.c_str());
     const uint16_t scan_port = network_state_.udp_port;
 
     network_state_.scan_thread = std::thread([this, interface_info, scan_port]() {
@@ -897,7 +1279,7 @@ void ControllerDiagnosticDemo::StartLanScan() {
             network_state_.discovered_devices = devices;
             network_state_.scan_in_progress = false;
             network_state_.scan_status =
-                    Fmt("Scan complete: %d peer(s) on %s", static_cast<int>(devices.size()),
+                    Fmt("扫描完成：%d 台设备，接口 %s", static_cast<int>(devices.size()),
                         interface_info.interface_name.c_str());
             const int max_index = static_cast<int>(devices.size());
             network_state_.selected_target_index = std::clamp(network_state_.selected_target_index, 0, max_index);
@@ -920,7 +1302,7 @@ void ControllerDiagnosticDemo::AdvanceSelectedLanTarget(int delta) {
             network_state_.selected_target_index = next_index;
         }
     }
-    last_ui_event_ = Fmt("UDP target switched to %s", BuildSelectedTargetLabel().c_str());
+    last_ui_event_ = Fmt("UDP 目标已切换到 %s", BuildSelectedTargetLabel().c_str());
 }
 
 ControllerDiagnosticDemo::LanInterfaceInfo ControllerDiagnosticDemo::QueryLanInterface() const {
@@ -1076,8 +1458,8 @@ std::string ControllerDiagnosticDemo::BuildSelectedTargetLabel() const {
     std::lock_guard<std::mutex> lock(network_state_.device_mutex);
     if (network_state_.selected_target_index <= 0 ||
         network_state_.selected_target_index > static_cast<int>(network_state_.discovered_devices.size())) {
-        return network_state_.interface_info.valid ? Fmt("Broadcast (%s)", network_state_.interface_info.broadcast_ip.c_str())
-                                                   : "Broadcast";
+        return network_state_.interface_info.valid ? Fmt("广播 (%s)", network_state_.interface_info.broadcast_ip.c_str())
+                                                   : "广播";
     }
 
     const auto& device = network_state_.discovered_devices[network_state_.selected_target_index - 1];
@@ -1125,7 +1507,7 @@ std::string ControllerDiagnosticDemo::BuildUdpPayloadJson(uint64_t sequence) con
     };
 
     const auto build_hand_json = [&](int hand) {
-        const RobotHandMetrics metrics = ComputeRobotHandMetrics(hand);
+        const RobotHandMetrics metrics = ApplyCalibration(hand, ComputeRobotHandMetrics(hand));
         const auto& hand_state = hand_states_[hand];
         const bool palm_valid = hand_state.active && IsJointPoseValid(hand_state.joints, XR_HAND_JOINT_PALM_EXT);
         const bool index_tip_valid = hand_state.active && IsJointPoseValid(hand_state.joints, XR_HAND_JOINT_INDEX_TIP_EXT);
@@ -1133,11 +1515,14 @@ std::string ControllerDiagnosticDemo::BuildUdpPayloadJson(uint64_t sequence) con
         std::ostringstream stream;
         stream << "{\"hand\":\"" << (hand == Side::LEFT ? "left" : "right") << "\""
                << ",\"tracked\":" << JsonBool(hand_state.active)
+               << ",\"calibrated\":" << JsonBool(hand_calibration_states_[hand].calibrated)
                << ",\"palm_position_m\":" << build_position_json(palm_valid, metrics.palm_position)
                << ",\"index_tip_position_m\":" << build_position_json(index_tip_valid, metrics.index_tip_position)
                << ",\"joint_angles_deg\":{"
-               << "\"thumb_side\":" << build_angle_json(metrics.thumb_side_valid, metrics.thumb_side) << ","
-               << "\"thumb_bend\":" << build_angle_json(metrics.thumb_bend_valid, metrics.thumb_bend) << ","
+               << "\"thumb_x\":" << build_angle_json(metrics.thumb_x_valid, metrics.thumb_x) << ","
+               << "\"thumb_y\":" << build_angle_json(metrics.thumb_y_valid, metrics.thumb_y) << ","
+               << "\"thumb_side\":" << build_angle_json(metrics.thumb_x_valid, metrics.thumb_x) << ","
+               << "\"thumb_bend\":" << build_angle_json(metrics.thumb_y_valid, metrics.thumb_y) << ","
                << "\"index_bend\":" << build_angle_json(metrics.index_bend_valid, metrics.index_bend) << ","
                << "\"middle_bend\":" << build_angle_json(metrics.middle_bend_valid, metrics.middle_bend) << ","
                << "\"ring_bend\":" << build_angle_json(metrics.ring_bend_valid, metrics.ring_bend) << ","
@@ -1185,34 +1570,30 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
 
     std::string selected_target =
             selected_target_index <= 0 || selected_target_index > static_cast<int>(devices.size())
-                    ? (interface_info.valid ? Fmt("Broadcast (%s)", interface_info.broadcast_ip.c_str()) : "Broadcast")
+                    ? (interface_info.valid ? Fmt("广播 (%s)", interface_info.broadcast_ip.c_str()) : "广播")
                     : Fmt("%s (%s)", devices[selected_target_index - 1].ip.c_str(),
                           devices[selected_target_index - 1].mac.c_str());
 
     std::ostringstream stream;
-    stream << "UDP stream  " << (udp_enabled ? "ON" : "OFF") << "\n";
-    stream << "Local interface  "
+    stream << "UDP 推流  " << (udp_enabled ? "开启" : "关闭") << "\n";
+    stream << "本机接口  "
            << (interface_info.valid ? Fmt("%s  %s", interface_info.interface_name.c_str(), interface_info.local_ip.c_str())
-                                    : "not found")
+                                    : "未找到")
            << "\n";
-    stream << "Broadcast  " << (interface_info.valid ? interface_info.broadcast_ip : "n/a") << "\n";
-    stream << "Port  " << udp_port << "\n";
-    stream << "Target  " << selected_target << "\n";
-    stream << "Scan status  " << (scan_in_progress ? "running" : scan_status) << "\n";
-    stream << "Packets sent  " << packet_sequence << "\n";
-    stream << "Peers  " << devices.size() << "\n";
+    stream << "广播地址  " << (interface_info.valid ? interface_info.broadcast_ip : "无") << "\n";
+    stream << "端口  " << udp_port << "\n";
+    stream << "目标  " << selected_target << "\n";
+    stream << "扫描状态  " << (scan_in_progress ? "扫描中" : scan_status) << "\n";
+    stream << "已发包  " << packet_sequence << "\n";
+    stream << "发现设备  " << devices.size() << "\n";
     if (!devices.empty()) {
-        stream << "Available devices\n";
-        const size_t max_devices_to_show = std::min<size_t>(devices.size(), 6);
+        stream << "设备列表\n";
+        const size_t max_devices_to_show = std::min<size_t>(devices.size(), 4);
         for (size_t index = 0; index < max_devices_to_show; ++index) {
             stream << "  " << (index + 1) << ". " << devices[index].ip << "  " << devices[index].mac << "\n";
         }
     }
-    stream << "JSON payload\n";
-    stream << "sequence, frame, predicted_display_time_sec,\n";
-    stream << "hands[left/right].palm_position_m,\n";
-    stream << "hands[left/right].index_tip_position_m,\n";
-    stream << "six joint angles for robot mapping";
+    stream << "数据内容  序号、帧号、预测显示时间、掌心与食指尖位置、拇指 X/Y 与四指弯曲角";
     return stream.str();
 }
 
@@ -1248,7 +1629,7 @@ void ControllerDiagnosticDemo::UpdateNetworkStreaming() {
     sockaddr_in target_addr{};
     if (!ResolveSelectedTarget(&target_addr)) {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-        network_state_.scan_status = "Target resolution failed";
+        network_state_.scan_status = "目标地址解析失败";
         return;
     }
 
@@ -1259,13 +1640,13 @@ void ControllerDiagnosticDemo::UpdateNetworkStreaming() {
     {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
         network_state_.scan_status =
-                send_result >= 0 ? Fmt("Last UDP send OK, %d bytes", send_result) : "UDP send failed";
+                send_result >= 0 ? Fmt("最近一次 UDP 发送成功，%d 字节", send_result) : "UDP 发送失败";
     }
 }
 
 bool ControllerDiagnosticDemo::InitializeHandTracking() {
     hand_tracking_ready_ = false;
-    hand_tracking_create_error_ = "XR_EXT_hand_tracking unavailable";
+    hand_tracking_create_error_ = "运行时未提供 XR_EXT_hand_tracking";
 
     if (!hand_tracking_supported_) {
         return true;
@@ -1278,7 +1659,7 @@ bool ControllerDiagnosticDemo::InitializeHandTracking() {
         XR_FAILED(xrGetInstanceProcAddr(GetXrInstance(), "xrLocateHandJointsEXT",
                                         reinterpret_cast<PFN_xrVoidFunction*>(&xrLocateHandJointsEXT_))) ||
         xrCreateHandTrackerEXT_ == nullptr || xrDestroyHandTrackerEXT_ == nullptr || xrLocateHandJointsEXT_ == nullptr) {
-        hand_tracking_create_error_ = "Failed to resolve hand tracking entry points";
+        hand_tracking_create_error_ = "手部追踪入口函数解析失败";
         return true;
     }
 
@@ -1303,7 +1684,7 @@ bool ControllerDiagnosticDemo::InitializeHandTracking() {
 
     hand_tracking_ready_ = created_trackers > 0;
     hand_tracking_create_error_ =
-            hand_tracking_ready_ ? "ready" : Fmt("Tracker creation failed: %s", to_string(last_error));
+            hand_tracking_ready_ ? "就绪" : Fmt("追踪器创建失败：%s", to_string(last_error));
     return true;
 }
 
@@ -1466,11 +1847,11 @@ void ControllerDiagnosticDemo::UpdateRuntimeState() {
                                  static_cast<int>(hand_states_[Side::RIGHT].active);
         dashboard_window_->UpdateText(
                 hero_summary_text_id_,
-                Fmt("PICO4 Input Studio\nPure pose capture mode with live controller telemetry and hand skeletal "
-                    "diagnostics.\nActive controllers: %d  |  Active hands: %d  |  Hand tracking: %s",
-                    active_controllers, active_hands, hand_tracking_ready_ ? "ready" : hand_tracking_create_error_.c_str())
+                Fmt("PICO 4  |  帧 %lld  |  手柄 %d  |  手部 %d  |  手部追踪 %s",
+                    static_cast<long long>(current_frame_in_.frame_number), active_controllers, active_hands,
+                    hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str())
                         .c_str());
-        dashboard_window_->UpdateText(event_text_id_, Fmt("Recent event: %s", last_ui_event_.c_str()).c_str());
+        dashboard_window_->UpdateText(event_text_id_, Fmt("最近事件：%s", last_ui_event_.c_str()).c_str());
     }
 
     if (controller_window_ != nullptr) {
@@ -1492,13 +1873,13 @@ void ControllerDiagnosticDemo::UpdateRuntimeState() {
 
         runtime_window_->UpdateText(
                 runtime_text_id_,
-                Fmt("Frame: %lld\nPredicted display time: %.3f s\nControllers active: %d\nHands active: %d\n"
-                    "Hand ext: %s\nAim ext: %s\nData source ext: %s\nTracker init: %s",
+                Fmt("帧号：%lld\n预测显示时间：%.3f 秒\n在线手柄：%d\n在线手部：%d\n"
+                    "手部扩展：%s\n瞄准扩展：%s\n数据源扩展：%s\n追踪器状态：%s",
                     static_cast<long long>(current_frame_in_.frame_number),
                     SecondsFromXrTime(current_frame_in_.predicted_display_time), active_controllers, active_hands,
-                    hand_tracking_supported_ ? "enabled" : "missing",
-                    hand_tracking_aim_enabled_ ? "enabled" : "disabled for pose capture",
-                    hand_tracking_source_supported_ ? "enabled" : "missing", hand_tracking_create_error_.c_str())
+                    hand_tracking_supported_ ? "已启用" : "缺失",
+                    hand_tracking_aim_enabled_ ? "已启用" : "已关闭",
+                    hand_tracking_source_supported_ ? "已启用" : "缺失", hand_tracking_create_error_.c_str())
                         .c_str());
     }
 
@@ -1509,6 +1890,212 @@ void ControllerDiagnosticDemo::UpdateRuntimeState() {
 
     if (network_window_ != nullptr) {
         network_window_->UpdateText(network_status_text_id_, BuildNetworkPanelText().c_str());
+    }
+
+    if (dashboard_window_ != nullptr) {
+        const int active_controllers =
+                static_cast<int>(current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE) +
+                static_cast<int>(current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE);
+        const int active_hands = static_cast<int>(hand_states_[Side::LEFT].active) +
+                                 static_cast<int>(hand_states_[Side::RIGHT].active);
+
+        std::string runtime_title = "运行总览";
+        std::string controller_title = "手柄状态";
+        std::string mapping_title = "灵巧手映射";
+        std::string network_title = "网络工具";
+        std::string hand_title = "手部追踪";
+        std::string runtime_body = Fmt("预测显示时间  %.3f 秒\n"
+                                       "在线手柄  %d\n"
+                                       "在线手部  %d\n"
+                                       "手部扩展  %s\n"
+                                       "瞄准扩展  %s\n"
+                                       "数据源扩展  %s\n"
+                                       "追踪器状态  %s",
+                                       SecondsFromXrTime(current_frame_in_.predicted_display_time),
+                                       active_controllers, active_hands,
+                                       hand_tracking_supported_ ? "已启用" : "缺失",
+                                       hand_tracking_aim_enabled_ ? "已启用" : "已关闭",
+                                       hand_tracking_source_supported_ ? "已启用" : "缺失",
+                                       hand_tracking_create_error_.c_str());
+        std::string controller_body =
+                Fmt("%s\n\n%s", BuildControllerText(Side::LEFT).c_str(), BuildControllerText(Side::RIGHT).c_str());
+        std::string hand_body = Fmt("%s\n\n%s", BuildHandText(Side::LEFT).c_str(), BuildHandText(Side::RIGHT).c_str());
+        std::string mapping_left_body = BuildRobotMappingText(Side::LEFT);
+        std::string mapping_right_body = BuildRobotMappingText(Side::RIGHT);
+        std::string network_body = BuildNetworkPanelText();
+        std::string footer_hint = "建议流程：先确认输入状态，再扫描局域网、切换目标，最后开启 UDP 推流。";
+        const std::string calibration_status = BuildCalibrationStatusText();
+
+        switch (dashboard_section_) {
+            case DashboardSection::Overview:
+                runtime_body = Fmt("预测显示  %.3f 秒\n"
+                                   "在线手柄  %d / 2\n"
+                                   "在线手部  %d / 2\n"
+                                   "手追扩展  %s\n"
+                                   "追踪器  %s",
+                                   SecondsFromXrTime(current_frame_in_.predicted_display_time),
+                                   active_controllers, active_hands,
+                                   hand_tracking_supported_ ? "已启用" : "缺失",
+                                   hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str());
+                controller_body = Fmt("左手柄\n状态  %s\n扳机 %.2f  握把 %.2f\n电量 %.1f / 5\n\n"
+                                      "右手柄\n状态  %s\n扳机 %.2f  握把 %.2f\n电量 %.1f / 5",
+                                      current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE ? "在线" : "离线",
+                                      current_frame_in_.controller_trigger_value[Side::LEFT],
+                                      current_frame_in_.controller_grip_value[Side::LEFT],
+                                      current_frame_in_.controller_battery_value[Side::LEFT],
+                                      current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE ? "在线" : "离线",
+                                      current_frame_in_.controller_trigger_value[Side::RIGHT],
+                                      current_frame_in_.controller_grip_value[Side::RIGHT],
+                                      current_frame_in_.controller_battery_value[Side::RIGHT]);
+                hand_body = Fmt("左手\n状态  %s\n捏合 %.0f%%\n\n"
+                                "右手\n状态  %s\n捏合 %.0f%%",
+                                hand_states_[Side::LEFT].active ? "在线" : "离线",
+                                hand_states_[Side::LEFT].pinch_index * 100.0f,
+                                hand_states_[Side::RIGHT].active ? "在线" : "离线",
+                                hand_states_[Side::RIGHT].pinch_index * 100.0f);
+                mapping_left_body = Fmt("左手映射\n拇指 X %s\n拇指 Y %s\n食指 %s\n中指 %s",
+                                        hand_calibration_states_[Side::LEFT].calibrated ? "已校准" : "未校准",
+                                        hand_calibration_states_[Side::LEFT].calibrated ? "已校准" : "未校准",
+                                        hand_states_[Side::LEFT].active ? "在线" : "等待",
+                                        hand_states_[Side::LEFT].active ? "在线" : "等待");
+                mapping_right_body = Fmt("右手映射\n拇指 X %s\n拇指 Y %s\n食指 %s\n中指 %s",
+                                         hand_calibration_states_[Side::RIGHT].calibrated ? "已校准" : "未校准",
+                                         hand_calibration_states_[Side::RIGHT].calibrated ? "已校准" : "未校准",
+                                         hand_states_[Side::RIGHT].active ? "在线" : "等待",
+                                         hand_states_[Side::RIGHT].active ? "在线" : "等待");
+                network_body = Fmt("UDP  %s\n本机  %s\n目标  %s\n端口  %u\n设备  %d 台",
+                                   network_state_.udp_enabled ? "开启" : "关闭",
+                                   network_state_.interface_info.valid ? network_state_.interface_info.local_ip.c_str() : "未找到",
+                                   BuildSelectedTargetLabel().c_str(),
+                                   static_cast<unsigned int>(network_state_.udp_port),
+                                   static_cast<int>(network_state_.discovered_devices.size()));
+                footer_hint = Fmt("最近事件：%s", last_ui_event_.c_str());
+                break;
+            case DashboardSection::Controller:
+                runtime_title = "输入总览";
+                controller_title = "左手柄";
+                hand_title = "右手柄";
+                mapping_title = "按键与触摸";
+                network_title = "操作提示";
+                runtime_body = Fmt("当前帧  %lld\n在线手柄  %d / 2\n最近事件  %s\n"
+                                   "左摇杆  %.2f, %.2f\n右摇杆  %.2f, %.2f",
+                                   static_cast<long long>(current_frame_in_.frame_number), active_controllers,
+                                   last_ui_event_.c_str(), current_frame_in_.left_joystick_position.x,
+                                   current_frame_in_.left_joystick_position.y,
+                                   current_frame_in_.right_joystick_position.x,
+                                   current_frame_in_.right_joystick_position.y);
+                controller_body = BuildControllerText(Side::LEFT);
+                hand_body = BuildControllerText(Side::RIGHT);
+                mapping_left_body =
+                        Fmt("左手输入\n%s\n\n右手输入\n%s",
+                            BuildButtonSummary(Side::LEFT).c_str(), BuildButtonSummary(Side::RIGHT).c_str());
+                mapping_right_body = Fmt("常用动作\n左手震动  触发左控制器震动\n右手震动  触发右控制器震动\n"
+                                         "开始校准  手势上线后等待 2 秒取零点\n最近事件  %s",
+                                         last_ui_event_.c_str());
+                network_body = Fmt("当前 UDP 目标  %s\n端口  %u\n推流  %s\n"
+                                   "%s",
+                                   BuildSelectedTargetLabel().c_str(),
+                                   static_cast<unsigned int>(network_state_.udp_port),
+                                   network_state_.udp_enabled ? "开启" : "关闭",
+                                   calibration_status.c_str());
+                footer_hint = "手柄页会把左右控制器拆开显示，便于看按键、摇杆、扳机和震动联调。";
+                break;
+            case DashboardSection::Hand:
+                runtime_title = "追踪状态";
+                controller_title = "左手骨架";
+                hand_title = "右手骨架";
+                mapping_title = "手势摘要";
+                network_title = "校准状态";
+                runtime_body = Fmt("手部扩展  %s\n瞄准扩展  %s\n数据源扩展  %s\n"
+                                   "在线手部  %d / 2\n追踪器状态  %s",
+                                   hand_tracking_supported_ ? "已启用" : "缺失",
+                                   hand_tracking_aim_enabled_ ? "已启用" : "已关闭",
+                                   hand_tracking_source_supported_ ? "已启用" : "缺失",
+                                   active_hands, hand_tracking_create_error_.c_str());
+                controller_body = BuildHandText(Side::LEFT);
+                hand_body = BuildHandText(Side::RIGHT);
+                mapping_left_body =
+                        Fmt("左手手势\n%s\n\n右手手势\n%s",
+                            BuildHandGestureSummary(Side::LEFT).c_str(),
+                            BuildHandGestureSummary(Side::RIGHT).c_str());
+                mapping_right_body = Fmt("说明\n拿起手柄后，运行时可能暂停相机驱动的手部骨架。\n"
+                                         "如果这里离线，但手柄在线，通常属于运行时策略，不一定是程序异常。");
+                network_body = Fmt("%s\n\n点击“开始校准”后，程序会等待手势上线，再延迟 2 秒记录零点。",
+                                   calibration_status.c_str());
+                footer_hint = "手部页用于确认骨架、捏合、数据源和校准状态，优先判断是不是运行时暂停了手追。";
+                break;
+            case DashboardSection::Network:
+                runtime_title = "网络状态";
+                controller_title = "目标选择";
+                hand_title = "推流控制";
+                mapping_title = "发送内容";
+                network_title = "扫描结果";
+                runtime_body = BuildNetworkPanelText();
+                controller_body = Fmt("当前目标  %s\n端口  %u\n扫描状态  %s\n已发现设备  %d 台",
+                                      BuildSelectedTargetLabel().c_str(),
+                                      static_cast<unsigned int>(network_state_.udp_port),
+                                      network_state_.scan_status.c_str(),
+                                      static_cast<int>(network_state_.discovered_devices.size()));
+                hand_body = Fmt("UDP 推流  %s\n发送一帧  %s\n最近事件  %s\n"
+                                "可用底部按钮：扫描局域网 / 上个目标 / 下个目标 / UDP 开关 / 发送一帧",
+                                network_state_.udp_enabled ? "开启" : "关闭",
+                                network_state_.send_snapshot_requested ? "已排队" : "空闲",
+                                last_ui_event_.c_str());
+                mapping_left_body = Fmt("发送字段概览\nframe=%lld\ncontroller_left=%s\ncontroller_right=%s\n"
+                                        "hand_left=%s\nhand_right=%s",
+                                        static_cast<long long>(current_frame_in_.frame_number),
+                                        current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE ? "online" : "offline",
+                                        current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE ? "online" : "offline",
+                                        hand_states_[Side::LEFT].active ? "online" : "offline",
+                                        hand_states_[Side::RIGHT].active ? "online" : "offline");
+                mapping_right_body = Fmt("联调建议\n1. 先扫描局域网\n2. 切目标\n3. 发送一帧验证\n4. 再打开持续 UDP\n"
+                                         "当前目标  %s",
+                                         BuildSelectedTargetLabel().c_str());
+                network_body = Fmt("接口  %s\n本机  %s\n广播  %s\n"
+                                   "如果一直找不到设备，先确认局域网、端口和对端监听状态。",
+                                   network_state_.interface_info.interface_name.c_str(),
+                                   network_state_.interface_info.local_ip.c_str(),
+                                   network_state_.interface_info.broadcast_ip.c_str());
+                footer_hint = "网络页专门用于局域网扫描和 UDP 推流联调，先验证单帧，再开持续发送。";
+                break;
+            case DashboardSection::Mapping:
+                runtime_title = "映射总览";
+                controller_title = "左手映射";
+                hand_title = "右手映射";
+                mapping_title = "映射解释";
+                network_title = "输出联调";
+                runtime_body = Fmt("在线手部  %d / 2\n追踪器状态  %s\n数据源扩展  %s\n"
+                                   "这一页重点查看灵巧手重定向所需角度。\n%s",
+                                   active_hands, hand_tracking_create_error_.c_str(),
+                                   hand_tracking_source_supported_ ? "已启用" : "缺失",
+                                   calibration_status.c_str());
+                controller_body = BuildRobotMappingText(Side::LEFT);
+                hand_body = BuildRobotMappingText(Side::RIGHT);
+                mapping_left_body = "当前映射关注项\n拇指 X侧摆\n拇指 Y弯曲\n食指弯曲\n中指弯曲\n无名指弯曲\n小指弯曲";
+                mapping_right_body =
+                        Fmt("手势参考\n左手  %s\n右手  %s\n\n校准后会以当前手势作为 0 点。",
+                            BuildHandGestureSummary(Side::LEFT).c_str(),
+                            BuildHandGestureSummary(Side::RIGHT).c_str());
+                network_body = Fmt("UDP 目标  %s\n推流  %s\n"
+                                   "如果映射角度正常，就可以切到网络页把 JSON 发给局域网对端。",
+                                   BuildSelectedTargetLabel().c_str(),
+                                   network_state_.udp_enabled ? "开启" : "关闭");
+                footer_hint = "映射页把左右手角度拆开看，更适合对接灵巧手或机械手的关节重定向。";
+                break;
+        }
+
+        dashboard_window_->UpdateText(runtime_title_text_id_, runtime_title.c_str());
+        dashboard_window_->UpdateText(controller_title_text_id_, controller_title.c_str());
+        dashboard_window_->UpdateText(mapping_title_text_id_, mapping_title.c_str());
+        dashboard_window_->UpdateText(network_title_text_id_, network_title.c_str());
+        dashboard_window_->UpdateText(hand_title_text_id_, hand_title.c_str());
+        dashboard_window_->UpdateText(runtime_text_id_, runtime_body.c_str());
+        dashboard_window_->UpdateText(left_controller_text_id_, controller_body.c_str());
+        dashboard_window_->UpdateText(right_controller_text_id_, hand_body.c_str());
+        dashboard_window_->UpdateText(left_robot_mapping_text_id_, mapping_left_body.c_str());
+        dashboard_window_->UpdateText(right_robot_mapping_text_id_, mapping_right_body.c_str());
+        dashboard_window_->UpdateText(network_status_text_id_, network_body.c_str());
+        dashboard_window_->UpdateText(footer_hint_text_id_, footer_hint.c_str());
     }
 }
 
@@ -1534,29 +2121,29 @@ void ControllerDiagnosticDemo::DetectInputEvents() {
     };
 
     const std::vector<std::pair<uint32_t, const char*>> button_names = {
-            {kButtonTriggerLeft, "L Trigger"},   {kButtonTriggerRight, "R Trigger"},
-            {kButtonGripTriggerLeft, "L Grip"},  {kButtonGripTriggerRight, "R Grip"},
-            {kButtonJoystickLeft, "L Stick"},    {kButtonJoystickRight, "R Stick"},
-            {kButtonX, "X"},                     {kButtonY, "Y"},
-            {kButtonA, "A"},                     {kButtonB, "B"},
-            {kButtonMenu, "Menu"},               {kButtonHome, "Home"},
-            {kButtonBackLeft, "L Back"},         {kButtonBackRight, "R Back"},
-            {kButtonTouchpadLeft, "L Touchpad"}, {kButtonTouchpadRight, "R Touchpad"},
-            {kButtonSideLeft, "L Side"},         {kButtonSideRight, "R Side"}};
+            {kButtonTriggerLeft, "左扳机"},     {kButtonTriggerRight, "右扳机"},
+            {kButtonGripTriggerLeft, "左握把"}, {kButtonGripTriggerRight, "右握把"},
+            {kButtonJoystickLeft, "左摇杆"},    {kButtonJoystickRight, "右摇杆"},
+            {kButtonX, "X"},                    {kButtonY, "Y"},
+            {kButtonA, "A"},                    {kButtonB, "B"},
+            {kButtonMenu, "菜单"},              {kButtonHome, "主页"},
+            {kButtonBackLeft, "左返回"},        {kButtonBackRight, "右返回"},
+            {kButtonTouchpadLeft, "左触控板"},  {kButtonTouchpadRight, "右触控板"},
+            {kButtonSideLeft, "左侧键"},        {kButtonSideRight, "右侧键"}};
     const std::vector<std::pair<uint32_t, const char*>> touch_names = {
-            {kTouchJoystickLeft, "L Stick"},       {kTouchJoystickRight, "R Stick"},
-            {kTouchTriggerLeft, "L Trigger"},      {kTouchTriggerRight, "R Trigger"},
-            {kTouchThumbRestLeft, "L Thumbrest"},  {kTouchThumbRestRight, "R Thumbrest"},
-            {kTouchRockerLeft, "L Rocker"},        {kTouchRockerRight, "R Rocker"},
-            {kTouchX, "X"},                        {kTouchY, "Y"},
-            {kTouchA, "A"},                        {kTouchB, "B"}};
+            {kTouchJoystickLeft, "左摇杆"},        {kTouchJoystickRight, "右摇杆"},
+            {kTouchTriggerLeft, "左扳机"},         {kTouchTriggerRight, "右扳机"},
+            {kTouchThumbRestLeft, "左拇指托"},     {kTouchThumbRestRight, "右拇指托"},
+            {kTouchRockerLeft, "左摇杆触摸"},      {kTouchRockerRight, "右摇杆触摸"},
+            {kTouchX, "X"},                       {kTouchY, "Y"},
+            {kTouchA, "A"},                       {kTouchB, "B"}};
 
     if (button_down != 0) {
-        last_ui_event_ = "Button down: " + describe_bits(button_down, button_names);
+        last_ui_event_ = "按键按下： " + describe_bits(button_down, button_names);
     } else if (button_up != 0) {
-        last_ui_event_ = "Button up: " + describe_bits(button_up, button_names);
+        last_ui_event_ = "按键抬起： " + describe_bits(button_up, button_names);
     } else if (touch_down != 0) {
-        last_ui_event_ = "Touch begin: " + describe_bits(touch_down, touch_names);
+        last_ui_event_ = "触摸开始： " + describe_bits(touch_down, touch_names);
     }
 
     previous_buttons_ = buttons;
@@ -1564,21 +2151,21 @@ void ControllerDiagnosticDemo::DetectInputEvents() {
 }
 
 std::string ControllerDiagnosticDemo::BuildControllerText(int hand) const {
-    const char* label = hand == Side::LEFT ? "Left Controller" : "Right Controller";
+    const char* label = hand == Side::LEFT ? "左手柄" : "右手柄";
     const auto& grip_pose = current_frame_in_.controller_poses[hand];
     const auto& aim_pose = current_frame_in_.controller_aim_poses[hand];
     const auto& stick = hand == Side::LEFT ? current_frame_in_.left_joystick_position
                                            : current_frame_in_.right_joystick_position;
 
     if (current_frame_in_.controller_actives[hand] != XR_TRUE) {
-        return Fmt("%s\nStatus: Inactive\nAnalog\nTrigger %.2f  Grip %.2f  Battery %.1f / 5\nStick %.2f, %.2f\n%s",
-                   label, current_frame_in_.controller_trigger_value[hand],
+        return Fmt("%s\n状态  离线\n扳机 %.2f  握把 %.2f\n电量 %.1f / 5\n摇杆 %.2f, %.2f\n%s", label,
+                   current_frame_in_.controller_trigger_value[hand],
                    current_frame_in_.controller_grip_value[hand], current_frame_in_.controller_battery_value[hand],
                    stick.x, stick.y, BuildButtonSummary(hand).c_str());
     }
 
-    return Fmt("%s\nStatus: Active\nGrip pose %.2f, %.2f, %.2f\nAim pose %.2f, %.2f, %.2f\n"
-               "Analog\nTrigger %.2f  Grip %.2f  Battery %.1f / 5\nStick %.2f, %.2f\n%s",
+    return Fmt("%s\n状态  在线\n握持 %.2f, %.2f, %.2f\n指向 %.2f, %.2f, %.2f\n"
+               "扳机 %.2f  握把 %.2f\n电量 %.1f / 5  摇杆 %.2f, %.2f\n%s",
                label, grip_pose.position.x, grip_pose.position.y, grip_pose.position.z, aim_pose.position.x,
                aim_pose.position.y, aim_pose.position.z, current_frame_in_.controller_trigger_value[hand],
                current_frame_in_.controller_grip_value[hand], current_frame_in_.controller_battery_value[hand], stick.x,
@@ -1590,21 +2177,20 @@ std::string ControllerDiagnosticDemo::BuildHandText(int hand) const {
     const auto& hand_state = hand_states_[hand];
 
     if (!hand_tracking_supported_) {
-        return Fmt("%s\nStatus: Unsupported\nThis runtime does not expose XR_EXT_hand_tracking.", label);
+        return Fmt("%s\n状态  不支持\n当前运行时未提供 XR_EXT_hand_tracking。", label);
     }
 
     if (!hand_state.tracker_ready) {
-        return Fmt("%s\nStatus: Tracker unavailable\nReason\n%s", label, hand_tracking_create_error_.c_str());
+        return Fmt("%s\n状态  追踪器不可用\n原因  %s", label, hand_tracking_create_error_.c_str());
     }
 
     if (!hand_state.active) {
-        return Fmt("%s\nStatus: Inactive\nIf controllers are held, the runtime may pause the camera-driven hand "
-                   "skeleton.",
+        return Fmt("%s\n状态  离线\n拿着手柄时，运行时可能暂停相机驱动的手部骨架。",
                    label);
     }
 
-    return Fmt("%s\nStatus: Active\nLive proxy: skeletal bones only\nPalm %.2f, %.2f, %.2f\n"
-               "Index tip %.2f, %.2f, %.2f\nCommand gestures filtered in app\n%s",
+    return Fmt("%s\n状态  在线\n手掌 %.2f, %.2f, %.2f\n"
+               "食指尖 %.2f, %.2f, %.2f\n%s",
                label, hand_state.palm_pose.position.x, hand_state.palm_pose.position.y, hand_state.palm_pose.position.z,
                hand_state.index_tip_pose.position.x, hand_state.index_tip_pose.position.y,
                hand_state.index_tip_pose.position.z,
@@ -1634,10 +2220,10 @@ ControllerDiagnosticDemo::RobotHandMetrics ControllerDiagnosticDemo::ComputeRobo
 
     if (IsJointPoseValid(joints, XR_HAND_JOINT_PALM_EXT) && IsJointPoseValid(joints, XR_HAND_JOINT_THUMB_METACARPAL_EXT) &&
         IsJointPoseValid(joints, XR_HAND_JOINT_THUMB_PROXIMAL_EXT)) {
-        metrics.thumb_bend_valid = true;
-        metrics.thumb_bend = AngleBetweenSegmentsDegrees(joints[XR_HAND_JOINT_PALM_EXT].pose.position,
-                                                         joints[XR_HAND_JOINT_THUMB_METACARPAL_EXT].pose.position,
-                                                         joints[XR_HAND_JOINT_THUMB_PROXIMAL_EXT].pose.position);
+        metrics.thumb_y_valid = true;
+        metrics.thumb_y = AngleBetweenSegmentsDegrees(joints[XR_HAND_JOINT_PALM_EXT].pose.position,
+                                                      joints[XR_HAND_JOINT_THUMB_METACARPAL_EXT].pose.position,
+                                                      joints[XR_HAND_JOINT_THUMB_PROXIMAL_EXT].pose.position);
     }
 
     if (IsJointPoseValid(joints, XR_HAND_JOINT_INDEX_METACARPAL_EXT) &&
@@ -1694,12 +2280,12 @@ ControllerDiagnosticDemo::RobotHandMetrics ControllerDiagnosticDemo::ComputeRobo
         if (NormalizeVectorSafe(&palm_normal)) {
             const XrVector3f thumb_on_palm = ProjectVectorOntoPlane(thumb_direction, palm_normal);
             const XrVector3f index_on_palm = ProjectVectorOntoPlane(palm_to_index, palm_normal);
-            metrics.thumb_side_valid = true;
-            metrics.thumb_side = AngleBetweenVectorsDegrees(thumb_on_palm, index_on_palm);
+            metrics.thumb_x_valid = true;
+            metrics.thumb_x = AngleBetweenVectorsDegrees(thumb_on_palm, index_on_palm);
         }
     }
 
-    metrics.valid = metrics.spatial_valid || metrics.thumb_side_valid || metrics.thumb_bend_valid ||
+    metrics.valid = metrics.spatial_valid || metrics.thumb_x_valid || metrics.thumb_y_valid ||
                     metrics.index_bend_valid || metrics.middle_bend_valid || metrics.ring_bend_valid ||
                     metrics.little_bend_valid;
     return metrics;
@@ -1710,36 +2296,38 @@ std::string ControllerDiagnosticDemo::BuildRobotMappingText(int hand) const {
     const auto& hand_state = hand_states_[hand];
 
     if (!hand_tracking_supported_) {
-        return Fmt("%s\nStatus: Unsupported\nHand tracking extension is not available.", label);
+        return Fmt("%s映射\n状态  不支持\n当前运行时没有手部追踪扩展。", label);
     }
 
     if (!hand_state.tracker_ready) {
-        return Fmt("%s\nStatus: Tracker unavailable\n%s", label, hand_tracking_create_error_.c_str());
+        return Fmt("%s映射\n状态  追踪器不可用\n%s", label, hand_tracking_create_error_.c_str());
     }
 
     if (!hand_state.active) {
-        return Fmt("%s\nStatus: Inactive\nAwaiting a live tracked hand skeleton.", label);
+        return Fmt("%s映射\n状态  离线\n等待实时手部骨架。", label);
     }
 
-    const RobotHandMetrics metrics = ComputeRobotHandMetrics(hand);
-    if (!metrics.valid) {
-        return Fmt("%s\nStatus: Active\nRobot mapping metrics are not ready yet.", label);
+    const RobotHandMetrics raw_metrics = ComputeRobotHandMetrics(hand);
+    const RobotHandMetrics metrics = ApplyCalibration(hand, raw_metrics);
+    if (!raw_metrics.valid) {
+        return Fmt("%s映射\n状态  在线\n映射角度数据仍在准备中。", label);
     }
 
-    const auto angle_line = [](const char* name, bool valid, float value) {
-        return valid ? Fmt("%s  %.1f deg", name, value) : Fmt("%s  n/a", name);
+    const auto angle_text = [](bool valid, float value) {
+        return valid ? Fmt("%.0f°", value) : std::string("无");
     };
 
-    return Fmt("%s\nStatus: Active\nHand root XYZ  %.3f, %.3f, %.3f m\nIndex tip XYZ  %.3f, %.3f, %.3f m\n"
-               "%s\n%s\n%s\n%s\n%s\n%s",
+    return Fmt("%s映射\n状态  在线\n掌心 %.3f, %.3f, %.3f 米\n食指尖 %.3f, %.3f, %.3f 米\n"
+               "拇指 X侧摆 %s  拇指 Y弯曲 %s\n食指 %s  中指 %s\n无名指 %s  小指 %s\n校准  %s",
                label, metrics.palm_position.x, metrics.palm_position.y, metrics.palm_position.z,
                metrics.index_tip_position.x, metrics.index_tip_position.y, metrics.index_tip_position.z,
-               angle_line("Thumb side", metrics.thumb_side_valid, metrics.thumb_side).c_str(),
-               angle_line("Thumb bend", metrics.thumb_bend_valid, metrics.thumb_bend).c_str(),
-               angle_line("Index bend", metrics.index_bend_valid, metrics.index_bend).c_str(),
-               angle_line("Middle bend", metrics.middle_bend_valid, metrics.middle_bend).c_str(),
-               angle_line("Ring bend", metrics.ring_bend_valid, metrics.ring_bend).c_str(),
-               angle_line("Little bend", metrics.little_bend_valid, metrics.little_bend).c_str());
+               angle_text(metrics.thumb_x_valid, metrics.thumb_x).c_str(),
+               angle_text(metrics.thumb_y_valid, metrics.thumb_y).c_str(),
+               angle_text(metrics.index_bend_valid, metrics.index_bend).c_str(),
+               angle_text(metrics.middle_bend_valid, metrics.middle_bend).c_str(),
+               angle_text(metrics.ring_bend_valid, metrics.ring_bend).c_str(),
+               angle_text(metrics.little_bend_valid, metrics.little_bend).c_str(),
+               hand_calibration_states_[hand].status.c_str());
 }
 
 std::string ControllerDiagnosticDemo::BuildButtonSummary(int hand) const {
@@ -1773,28 +2361,28 @@ std::string ControllerDiagnosticDemo::BuildButtonSummary(int hand) const {
         *text += name;
     };
 
-    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_trigger) != 0, "Trigger");
-    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_grip) != 0, "Grip");
-    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_stick) != 0, "Stick");
-    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_back) != 0, "Back");
-    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_pad) != 0, "Touchpad");
-    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_side) != 0, "Side");
+    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_trigger) != 0, "扳机");
+    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_grip) != 0, "握把");
+    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_stick) != 0, "摇杆");
+    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_back) != 0, "返回");
+    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_pad) != 0, "触控板");
+    append(&button_text, (current_frame_in_.all_buttons_bitmask & left_or_right_side) != 0, "侧键");
 
     if (hand == Side::LEFT) {
         append(&button_text, (current_frame_in_.all_buttons_bitmask & kButtonX) != 0, "X");
         append(&button_text, (current_frame_in_.all_buttons_bitmask & kButtonY) != 0, "Y");
-        append(&button_text, (current_frame_in_.all_buttons_bitmask & kButtonMenu) != 0, "Menu");
+        append(&button_text, (current_frame_in_.all_buttons_bitmask & kButtonMenu) != 0, "菜单");
     } else {
         append(&button_text, (current_frame_in_.all_buttons_bitmask & kButtonA) != 0, "A");
         append(&button_text, (current_frame_in_.all_buttons_bitmask & kButtonB) != 0, "B");
-        append(&button_text, (current_frame_in_.all_buttons_bitmask & kButtonHome) != 0, "Home");
+        append(&button_text, (current_frame_in_.all_buttons_bitmask & kButtonHome) != 0, "主页");
     }
 
     std::string touch_text;
-    append(&touch_text, (current_frame_in_.all_touches_bitmask & left_or_right_touch_trigger) != 0, "Trigger");
-    append(&touch_text, (current_frame_in_.all_touches_bitmask & left_or_right_touch_stick) != 0, "Stick");
-    append(&touch_text, (current_frame_in_.all_touches_bitmask & left_or_right_thumb) != 0, "Thumbrest");
-    append(&touch_text, (current_frame_in_.all_touches_bitmask & left_or_right_rocker) != 0, "Rocker");
+    append(&touch_text, (current_frame_in_.all_touches_bitmask & left_or_right_touch_trigger) != 0, "扳机");
+    append(&touch_text, (current_frame_in_.all_touches_bitmask & left_or_right_touch_stick) != 0, "摇杆");
+    append(&touch_text, (current_frame_in_.all_touches_bitmask & left_or_right_thumb) != 0, "拇指托");
+    append(&touch_text, (current_frame_in_.all_touches_bitmask & left_or_right_rocker) != 0, "摇杆触摸");
     if (hand == Side::LEFT) {
         append(&touch_text, (current_frame_in_.all_touches_bitmask & kTouchX) != 0, "X");
         append(&touch_text, (current_frame_in_.all_touches_bitmask & kTouchY) != 0, "Y");
@@ -1803,48 +2391,24 @@ std::string ControllerDiagnosticDemo::BuildButtonSummary(int hand) const {
         append(&touch_text, (current_frame_in_.all_touches_bitmask & kTouchB) != 0, "B");
     }
 
-    return Fmt("Buttons\n%s\nTouches\n%s", button_text.empty() ? "none" : button_text.c_str(),
-               touch_text.empty() ? "none" : touch_text.c_str());
+    return Fmt("按键  %s\n触摸  %s", button_text.empty() ? "无" : button_text.c_str(),
+               touch_text.empty() ? "无" : touch_text.c_str());
 }
 
 std::string ControllerDiagnosticDemo::BuildHandGestureSummary(int hand) const {
     const auto& hand_state = hand_states_[hand];
 
     if (!hand_state.active) {
-        return "Joint angles unavailable";
+        return "数据源  无\n捏合  0%";
     }
 
-    const char* data_source = "unknown";
+    const char* data_source = "未知";
     if (hand_tracking_source_supported_ && hand_state.data_source_active) {
-        data_source = hand_state.data_source == XR_HAND_TRACKING_DATA_SOURCE_UNOBSTRUCTED_EXT ? "camera/unobstructed"
-                                                                                               : "controller-assisted";
+        data_source = hand_state.data_source == XR_HAND_TRACKING_DATA_SOURCE_UNOBSTRUCTED_EXT ? "相机直追"
+                                                                                               : "控制器辅助";
     }
 
-    std::string angle_lines = Fmt("Source\n%s", data_source);
-    for (const auto& chain : kFingerAngleChains) {
-        bool valid = true;
-        for (const auto joint : chain.joints) {
-            valid &= IsPoseValid(hand_state.joints[joint]);
-        }
-        if (!valid) {
-            angle_lines += Fmt("\n%s\nn/a", chain.name);
-            continue;
-        }
-
-        const float a0 = AngleBetweenSegmentsDegrees(hand_state.joints[chain.joints[0]].pose.position,
-                                                     hand_state.joints[chain.joints[1]].pose.position,
-                                                     hand_state.joints[chain.joints[2]].pose.position);
-        const float a1 = AngleBetweenSegmentsDegrees(hand_state.joints[chain.joints[1]].pose.position,
-                                                     hand_state.joints[chain.joints[2]].pose.position,
-                                                     hand_state.joints[chain.joints[3]].pose.position);
-        const float a2 = AngleBetweenSegmentsDegrees(hand_state.joints[chain.joints[2]].pose.position,
-                                                     hand_state.joints[chain.joints[3]].pose.position,
-                                                     hand_state.joints[chain.joints[4]].pose.position);
-        angle_lines += Fmt("\n%s\n%s %.0f  %s %.0f  %s %.0f", chain.name, chain.labels[0], a0, chain.labels[1], a1,
-                           chain.labels[2], a2);
-    }
-
-    return angle_lines;
+    return Fmt("数据源  %s\n捏合  %.0f%%", data_source, hand_state.pinch_index * 100.0f);
 }
 
 void ControllerDiagnosticDemo::SpawnDebugCube() {
@@ -1857,7 +2421,7 @@ void ControllerDiagnosticDemo::SpawnDebugCube() {
     const float z = -1.95f - row * 0.10f;
     auto cube = std::make_shared<Cube>(MakePose(x, y, z), MakeUniformScale(0.08f));
     spawned_cube_ids_.push_back(scene.AddObject(cube));
-    last_ui_event_ = Fmt("Spawned debug cube #%d", static_cast<int>(spawned_cube_ids_.size()));
+    last_ui_event_ = Fmt("已生成调试方块 #%d", static_cast<int>(spawned_cube_ids_.size()));
 }
 
 void ControllerDiagnosticDemo::ClearSpawnedCubes() {
@@ -1866,40 +2430,16 @@ void ControllerDiagnosticDemo::ClearSpawnedCubes() {
         scene.RemoveObject(id);
     }
     spawned_cube_ids_.clear();
-    last_ui_event_ = "Cleared debug cubes";
+    last_ui_event_ = "已清空调试方块";
 }
 
 void ControllerDiagnosticDemo::ResetPanelPose() {
-    dashboard_pose_ = MakePose(0.0f, 0.24f, -1.18f);
-    controller_pose_ = MakePose(-0.52f, -0.18f, -1.26f);
-    hand_pose_ = MakePose(0.52f, -0.18f, -1.26f);
-    action_pose_ = MakePose(0.0f, -0.78f, -1.16f);
-    runtime_pose_ = MakePose(0.88f, 0.36f, -1.56f);
-    robot_mapping_pose_ = MakePose(-0.88f, 0.36f, -1.56f);
-    network_pose_ = MakePose(0.0f, -0.12f, -1.72f);
+    dashboard_pose_ = MakePose(0.0f, 0.06f, -1.18f);
 
     if (dashboard_plane_ != nullptr) {
         dashboard_plane_->SetPose(dashboard_pose_);
     }
-    if (controller_plane_ != nullptr) {
-        controller_plane_->SetPose(controller_pose_);
-    }
-    if (hand_plane_ != nullptr) {
-        hand_plane_->SetPose(hand_pose_);
-    }
-    if (action_plane_ != nullptr) {
-        action_plane_->SetPose(action_pose_);
-    }
-    if (runtime_plane_ != nullptr) {
-        runtime_plane_->SetPose(runtime_pose_);
-    }
-    if (robot_mapping_plane_ != nullptr) {
-        robot_mapping_plane_->SetPose(robot_mapping_pose_);
-    }
-    if (network_plane_ != nullptr) {
-        network_plane_->SetPose(network_pose_);
-    }
-    last_ui_event_ = "Recentered the full panel layout in front of the headset";
+    last_ui_event_ = "主面板已重新居中到头显前方";
 }
 
 void ControllerDiagnosticDemo::PulseController(int hand) {
@@ -1919,8 +2459,8 @@ void ControllerDiagnosticDemo::PulseController(int hand) {
     const XrResult result =
             xrApplyHapticFeedback(GetXrSession(), &info, reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
     last_ui_event_ = XR_SUCCEEDED(result)
-                             ? Fmt("%s controller haptic pulse", hand == Side::LEFT ? "Left" : "Right")
-                             : Fmt("%s haptic failed: %s", hand == Side::LEFT ? "Left" : "Right", to_string(result));
+                            ? Fmt("%s手柄震动已触发", hand == Side::LEFT ? "左" : "右")
+                            : Fmt("%s手柄震动失败：%s", hand == Side::LEFT ? "左" : "右", to_string(result));
 }
 
 std::shared_ptr<Object> ControllerDiagnosticDemo::CreateControllerModel(int hand) {

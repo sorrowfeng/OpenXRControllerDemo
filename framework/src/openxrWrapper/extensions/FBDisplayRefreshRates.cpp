@@ -152,7 +152,7 @@ namespace PVRSampleFW {
     int FBDisplayRefreshRates::GetDisplayRefreshRateFB(float *displayRefreshRate) {
         CHECK_POINTER_ARG_IS_NOT_NULL(xrGetDisplayRefreshRateFB);
         int ret = xrGetDisplayRefreshRateFB(openxr_wrapper_->GetXrSession(), displayRefreshRate);
-        PLOGI("FBDisplayRefreshRates::GetDisplayRefreshRateFB ret: %d, rate: %d", ret, *displayRefreshRate);
+        PLOGI("FBDisplayRefreshRates::GetDisplayRefreshRateFB ret: %d, rate: %f", ret, *displayRefreshRate);
         return ret;
     }
 

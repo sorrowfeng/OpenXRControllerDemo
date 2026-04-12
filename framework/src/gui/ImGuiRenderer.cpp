@@ -23,12 +23,21 @@
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include <algorithm>
+#include <array>
+#include <unistd.h>
 
 namespace PVRSampleFW {
     namespace {
         constexpr int kMinGuiFontSize = 16;
         constexpr int kMaxGuiFontSize = 40;
         constexpr int kGuiFontSizeInterval = 4;
+        constexpr std::array<const char*, 4> kPreferredFontPaths{{
+                "/system/fonts/PICOSansSC-Regular.ttf",
+                "/system/fonts/PICOSansSC-Medium.ttf",
+                "/system/fonts/NotoSansCJK-Regular.ttc",
+                "/system/fonts/DroidSans.ttf",
+        }};
+        constexpr std::array<int, 7> kPreloadedFontSizes{{16, 20, 24, 28, 32, 36, 40}};
 
         int NormalizeGuiFontSize(int fontSize) {
             if (fontSize <= kMinGuiFontSize) {
@@ -46,6 +55,59 @@ namespace PVRSampleFW {
 
         int FontSizeToIndex(int fontSize) {
             return (fontSize - kMinGuiFontSize) / kGuiFontSizeInterval;
+        }
+
+        ImFont *LoadGuiFont(ImGuiIO &io, float fontSize) {
+            const ImWchar *glyphRanges = io.Fonts->GetGlyphRangesChineseSimplifiedCommon();
+            for (const char *fontPath : kPreferredFontPaths) {
+                if (access(fontPath, R_OK) != 0) {
+                    continue;
+                }
+
+                ImFontConfig fontConfig;
+                fontConfig.SizePixels = fontSize;
+                fontConfig.OversampleH = 1;
+                fontConfig.OversampleV = 1;
+                fontConfig.PixelSnapH = false;
+                if (ImFont *font = io.Fonts->AddFontFromFileTTF(fontPath, fontSize, &fontConfig, glyphRanges);
+                    font != nullptr) {
+                    PLOGI("ImGuiRenderer loaded font %s size %.1f", fontPath, fontSize);
+                    return font;
+                }
+            }
+
+            ImFontConfig fallbackConfig;
+            fallbackConfig.SizePixels = fontSize;
+            PLOGW("ImGuiRenderer fallback to default font for size %.1f", fontSize);
+            return io.Fonts->AddFontDefault(&fallbackConfig);
+        }
+
+        void EnsureFontLoaded(ImGuiIO &io, RenderTarget *renderTarget, int fontSize) {
+            auto &font = renderTarget->font;
+            const int normalizedFontSize = NormalizeGuiFontSize(fontSize);
+            const int index = FontSizeToIndex(normalizedFontSize);
+            if (font[index] == nullptr) {
+                font[index] = LoadGuiFont(io, static_cast<float>(normalizedFontSize));
+            }
+        }
+
+        void LogWindowRenderStateOnce(const WindowConfig &config,
+                                      const std::unordered_map<int, WindowComponentConfig> &components,
+                                      const ImDrawData *drawData) {
+            static bool loggedOnce = false;
+            if (loggedOnce) {
+                return;
+            }
+            loggedOnce = true;
+            PLOGW("GUI debug window flags=%u size=%dx%d bg=(%.2f, %.2f, %.2f, %.2f) text=(%.2f, %.2f, %.2f, %.2f) components=%d",
+                  config.flags, config.width, config.height, config.bgColor[0], config.bgColor[1], config.bgColor[2],
+                  config.bgColor[3], config.textColor[0], config.textColor[1], config.textColor[2], config.textColor[3],
+                  static_cast<int>(components.size()));
+            if (drawData != nullptr) {
+                PLOGW("GUI debug draw lists=%d vertices=%d indices=%d display=(%.1f, %.1f)",
+                      drawData->CmdListsCount, drawData->TotalVtxCount, drawData->TotalIdxCount,
+                      drawData->DisplaySize.x, drawData->DisplaySize.y);
+            }
         }
     }  // namespace
 
@@ -196,11 +258,32 @@ namespace PVRSampleFW {
 
         renderTarget->imGuiContext = ImGui::CreateContext();
         ImGui::SetCurrentContext(renderTarget->imGuiContext);
-        ImGui::StyleColorsDark();
-        //        ImGui::StyleColorsLight();
-        //        ImGui::StyleColorsClassic();
+        ImGui::StyleColorsLight();
+        ImGuiStyle &style = ImGui::GetStyle();
+        style.WindowRounding = 20.0f;
+        style.FrameRounding = 14.0f;
+        style.PopupRounding = 14.0f;
+        style.ScrollbarRounding = 14.0f;
+        style.GrabRounding = 14.0f;
+        style.WindowPadding = ImVec2(18.0f, 18.0f);
+        style.FramePadding = ImVec2(10.0f, 8.0f);
+        style.ItemSpacing = ImVec2(12.0f, 10.0f);
+        style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
+        style.ButtonTextAlign = ImVec2(0.5f, 0.5f);
+        style.Colors[ImGuiCol_Text] = ImVec4(0.02f, 0.02f, 0.02f, 1.0f);
+        style.Colors[ImGuiCol_WindowBg] = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        style.Colors[ImGuiCol_Button] = ImVec4(0.82f, 0.87f, 0.94f, 1.0f);
+        style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.60f, 0.76f, 0.92f, 1.0f);
+        style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.35f, 0.60f, 0.88f, 1.0f);
+        style.Colors[ImGuiCol_FrameBg] = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.89f, 0.93f, 0.98f, 1.0f);
+        style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.80f, 0.88f, 0.97f, 1.0f);
+        style.Colors[ImGuiCol_Border] = ImVec4(0.72f, 0.78f, 0.86f, 0.9f);
+        style.Colors[ImGuiCol_TitleBg] = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        style.Colors[ImGuiCol_TitleBgActive] = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
         ImGui_ImplOpenGL3_Init("#version 300 es");
         ImGuiIO &io = ImGui::GetIO();
+        io.Fonts->Flags |= ImFontAtlasFlags_NoPowerOfTwoHeight;
 
         const int requestedFontSize = config.flags & GUI_WINDOW_CONFIG_FONT_SIZE ? config.textSize : DEFAULT_FONT_SIZE;
         default_font_size_ = NormalizeGuiFontSize(requestedFontSize);
@@ -208,41 +291,35 @@ namespace PVRSampleFW {
             PLOGW("ImGuiRenderer::ConfigRenderTarget normalize window font size from %d to %d", requestedFontSize,
                   default_font_size_);
         }
-        const int index = FontSizeToIndex(default_font_size_);
-        ImFontConfig fontConfig;
-        fontConfig.SizePixels = static_cast<float>(default_font_size_);
-        renderTarget->font[index] = io.Fonts->AddFontDefault(&fontConfig);
-
-        for (int i = 0; i < FONT_SIZE_NUM; ++i) {
-            checkNewFont(renderTarget, MIN_FONT_SIZE + i * FONT_SIZE_INTERVAL);
+        EnsureFontLoaded(io, renderTarget, default_font_size_);
+        for (const int size : kPreloadedFontSizes) {
+            EnsureFontLoaded(io, renderTarget, size);
         }
+        io.Fonts->Build();
+        ImGui_ImplOpenGL3_DestroyFontsTexture();
+        ImGui_ImplOpenGL3_CreateFontsTexture();
+        PLOGW("GUI debug default font size=%d tex_id=%p", default_font_size_, io.Fonts->TexID);
 
-        ImGui::GetStyle().ScaleAllSizes(3.0f);
+        io.FontGlobalScale = 1.0f;
+        ImGui::GetStyle().ScaleAllSizes(1.85f);
         PLOGW("ImGuiRenderer::configRenderTarget end");
     }
 
     void ImGuiRenderer::checkNewFont(RenderTarget *renderTarget, int fontSize) {
         ImGuiIO &io = ImGui::GetIO();
-        auto font = renderTarget->font;
-        const int normalizedFontSize = NormalizeGuiFontSize(fontSize);
-        const int index = FontSizeToIndex(normalizedFontSize);
-        if (font[index] == nullptr) {
-            ImFontConfig fontConfig;
-            fontConfig.SizePixels = static_cast<float>(normalizedFontSize);
-            font[index] = io.Fonts->AddFontDefault(&fontConfig);
-        }
+        EnsureFontLoaded(io, renderTarget, fontSize);
     }
 
     ImFont *ImGuiRenderer::GetFont(RenderTarget *renderTarget, int fontSize) {
-        auto font = renderTarget->font;
+        auto &font = renderTarget->font;
         const int normalizedFontSize = NormalizeGuiFontSize(fontSize);
         const int index = FontSizeToIndex(normalizedFontSize);
         if (normalizedFontSize != fontSize) {
             PLOGW("ImGuiRenderer::GetFont normalize font size from %d to %d", fontSize, normalizedFontSize);
         }
         if (font[index] == nullptr) {
-            PLOGE("ImGuiRenderer::GetFont fontSize(%d) is unavailable, use default size %d", normalizedFontSize,
-                  default_font_size_);
+            PLOGW("ImGuiRenderer::GetFont fontSize(%d) was not preloaded, fallback to default size %d",
+                  normalizedFontSize, default_font_size_);
             return font[FontSizeToIndex(default_font_size_)];
         }
 
@@ -429,6 +506,7 @@ namespace PVRSampleFW {
         ImGui::End();
 
         ImGui::Render();
+        LogWindowRenderStateOnce(config, components, ImGui::GetDrawData());
 
         // 3. Rendering
         glBindFramebuffer(GL_FRAMEBUFFER, renderTarget->framebufferId);

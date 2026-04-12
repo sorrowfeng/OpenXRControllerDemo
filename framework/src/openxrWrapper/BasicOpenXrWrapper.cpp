@@ -203,7 +203,10 @@ namespace PVRSampleFW {
 
         GetSystemProperties();
 
-        PLOGI("%s", Fmt("Using system %d for form factor %s", xr_system_id_, to_string(xr_form_factor_)).c_str());
+        PLOGI("%s",
+              Fmt("Using system %llu for form factor %s", static_cast<unsigned long long>(xr_system_id_),
+                  to_string(xr_form_factor_))
+                      .c_str());
         CHECK(xr_instance_ != XR_NULL_HANDLE);
         CHECK(xr_system_id_ != XR_NULL_SYSTEM_ID);
 
@@ -2374,28 +2377,24 @@ namespace PVRSampleFW {
     }
 
     int BasicOpenXrWrapper::GetControllerType() {
-        XrInteractionProfileState Profile;
-        Profile.type = XR_TYPE_INTERACTION_PROFILE_STATE;
-        Profile.next = nullptr;
-        auto ret = xrGetCurrentInteractionProfile(xr_session_, input_.controller_subaction_paths[Side::LEFT], &Profile);
-        char Path[128];
-        if (Profile.interactionProfile != XR_NULL_PATH) {
-            uint32_t PathCount;
-            xrPathToString(xr_instance_, Profile.interactionProfile, 128, &PathCount, Path);
-        }
-        PLOGI("GetControllerType xrGetCurrentInteractionProfile ret = %d Path  %s", ret, Path);
+        const std::string systemName = system_properties_.systemName;
+        PLOGI("GetControllerType infer from system name: %s", systemName.c_str());
 
-        if (strcmp(Path, "/interaction_profiles/bytedance/pico_neo3_controller") == 0) {
+        // The current PICO runtime on device can crash inside xrPathToString when
+        // querying the interaction profile during early-frame input polling.
+        // Prefer the already-cached system name as a stable fallback.
+        if (systemName.find("PICO NEO3") != std::string::npos || systemName.find("PICO Neo3") != std::string::npos) {
             controller_type_ = XR_CV3_Optics_Controller_Type;
-        } else if (strcmp(Path, "/interaction_profiles/bytedance/pico4_controller") == 0) {
-            controller_type_ = XR_CV3_Phoenix_Controller_Type;
-        } else if (strcmp(Path, "/interaction_profiles/bytedance/pico4s_controller") == 0) {
+        } else if (systemName.find("PICO 4S") != std::string::npos) {
             controller_type_ = XR_CV3_Hawk_Controller_Type;
-        } else if (strcmp(Path, "/interaction_profiles/bytedance/pico_g3_controller") == 0) {
+        } else if (systemName.find("PICO 4") != std::string::npos) {
+            controller_type_ = XR_CV3_Phoenix_Controller_Type;
+        } else if (systemName.find("PICO G3") != std::string::npos) {
             controller_type_ = XR_CV3_MerlinE_Controller_Type;
         } else {
             controller_type_ = Simple_Controller;
         }
+        PLOGI("GetControllerType selected controller_type_ = %d", controller_type_);
         return controller_type_;
     }
 
