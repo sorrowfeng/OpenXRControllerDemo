@@ -57,8 +57,17 @@ namespace PVRSampleFW {
             return (fontSize - kMinGuiFontSize) / kGuiFontSizeInterval;
         }
 
+        // Extra Chinese glyphs used in main.cpp that are not covered by GetGlyphRangesChineseSimplifiedCommon
+        static const char kExtraChineseGlyphs[] =
+            "扳帧摇源推握描播启停键域览端拇";
+
         ImFont *LoadGuiFont(ImGuiIO &io, float fontSize) {
-            const ImWchar *glyphRanges = io.Fonts->GetGlyphRangesChineseSimplifiedCommon();
+            ImVector<ImWchar> ranges;
+            ImFontGlyphRangesBuilder builder;
+            builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+            builder.AddText(kExtraChineseGlyphs);
+            builder.BuildRanges(&ranges);
+
             for (const char *fontPath : kPreferredFontPaths) {
                 if (access(fontPath, R_OK) != 0) {
                     continue;
@@ -69,7 +78,7 @@ namespace PVRSampleFW {
                 fontConfig.OversampleH = 1;
                 fontConfig.OversampleV = 1;
                 fontConfig.PixelSnapH = false;
-                if (ImFont *font = io.Fonts->AddFontFromFileTTF(fontPath, fontSize, &fontConfig, glyphRanges);
+                if (ImFont *font = io.Fonts->AddFontFromFileTTF(fontPath, fontSize, &fontConfig, ranges.Data);
                     font != nullptr) {
                     PLOGI("ImGuiRenderer loaded font %s size %.1f", fontPath, fontSize);
                     return font;

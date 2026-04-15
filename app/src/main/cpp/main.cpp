@@ -394,6 +394,7 @@ private:
         std::string scan_status{"空闲"};
         LanInterfaceInfo interface_info{};
         std::vector<LanDeviceInfo> discovered_devices{};
+        std::string manual_target_ip;
         mutable std::mutex device_mutex;
         std::thread scan_thread;
     };
@@ -442,6 +443,13 @@ private:
     void BeginHandCalibration();
     void ClearHandCalibration();
     void UpdateHandCalibration();
+    struct EulerDeg {
+        float pitch;
+        float yaw;
+        float roll;
+    };
+    EulerDeg QuatToEuler(const XrQuaternionf& q) const;
+
     RobotHandMetrics ApplyCalibration(int hand, const RobotHandMetrics& raw_metrics) const;
     std::string BuildCalibrationStatusText() const;
     void UpdateDashboardDragging();
@@ -679,6 +687,15 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             static_cast<int>(hand_states_[Side::LEFT].active) + static_cast<int>(hand_states_[Side::RIGHT].active);
     const std::string selected_target = BuildSelectedTargetLabel();
 
+    static char manual_ip_buffer[64] = {};
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        if (!network_state_.manual_target_ip.empty() && std::strcmp(manual_ip_buffer, network_state_.manual_target_ip.c_str()) != 0) {
+            std::strncpy(manual_ip_buffer, network_state_.manual_target_ip.c_str(), sizeof(manual_ip_buffer) - 1);
+            manual_ip_buffer[sizeof(manual_ip_buffer) - 1] = '\0';
+        }
+    }
+
     const auto section_label = [](DashboardSection section) {
         switch (section) {
             case DashboardSection::Overview: return "总览";
@@ -696,7 +713,30 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, color);
         ImGui::Button(label, ImVec2(width, 0.0f));
         ImGui::PopStyleColor(3);
-        ImGui::TextWrapped("%s", value);
+        // Fixed single-line display — truncate with "..." so the row height never changes.
+        const float avail_w = ImGui::GetContentRegionAvail().x;
+        const char* text_begin = value;
+        const char* text_end = text_begin + std::strlen(text_begin);
+        const char* clipped_end = ImGui::GetFont()->CalcWordWrapPositionA(
+                ImGui::GetFontSize() / ImGui::GetFont()->FontSize,
+                text_begin, text_end, avail_w);
+        if (clipped_end < text_end) {
+            // Measure "…" width and back up to fit
+            const char* suffix = "...";
+            const float suffix_w = ImGui::CalcTextSize(suffix).x;
+            clipped_end = ImGui::GetFont()->CalcWordWrapPositionA(
+                    ImGui::GetFontSize() / ImGui::GetFont()->FontSize,
+                    text_begin, text_end, avail_w - suffix_w);
+            char buf[256];
+            int copy_len = static_cast<int>(clipped_end - text_begin);
+            if (copy_len < 0) copy_len = 0;
+            if (copy_len > 250) copy_len = 250;
+            std::memcpy(buf, text_begin, copy_len);
+            std::memcpy(buf + copy_len, suffix, 4);
+            ImGui::TextUnformatted(buf, buf + copy_len + 3);
+        } else {
+            ImGui::TextUnformatted(text_begin, text_end);
+        }
     };
 
     const auto draw_card = [](const char* title, const ImVec2& size, const std::function<void()>& body) {
@@ -802,6 +842,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
 
     if (dashboard_section_ == DashboardSection::Overview) {
         ImGui::BeginChild("overview_grid", ImVec2(0, -170.0f), false);
+        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：长按 X 左手重置 / 长按 A 右手重置  |  短按 X/A 开关 UDP  |  扳机键可拖动窗口");
         ImGui::Columns(3, "overview_cols", false);
         draw_card("运行总览", ImVec2(0, 300.0f), [&]() {
             draw_big_text(Fmt("当前帧  %lld\n预测显示  %.3f 秒\n在线手柄  %d / 2\n在线手部  %d / 2\n"
@@ -836,6 +877,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
         ImGui::EndChild();
     } else if (dashboard_section_ == DashboardSection::Controller) {
         ImGui::BeginChild("controller_grid", ImVec2(0, -170.0f), false);
+        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：长按 X/A 重置对应手柄零点后，本页显示为相对位置与角度");
         ImGui::Columns(3, "controller_cols", false);
         draw_card("左手柄", ImVec2(0, 420.0f), [&]() { draw_big_text(BuildControllerText(Side::LEFT)); });
         ImGui::NextColumn();
@@ -851,6 +893,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
         ImGui::EndChild();
     } else if (dashboard_section_ == DashboardSection::Hand) {
         ImGui::BeginChild("hand_grid", ImVec2(0, -170.0f), false);
+        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：手部页可查看追踪状态，映射页查看关节角度与校准结果");
         ImGui::Columns(2, "hand_cols", false);
         draw_card("左手追踪", ImVec2(0, 430.0f), [&]() { draw_big_text(BuildHandText(Side::LEFT)); });
         ImGui::NextColumn();
@@ -880,6 +923,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
         ImGui::EndChild();
     } else {
         ImGui::BeginChild("network_grid", ImVec2(0, -170.0f), false);
+        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：先扫描局域网 → 选中目标 → 开启 UDP 才会发送 JSON 数据");
         ImGui::Columns(2, "network_cols", false);
 
         // 左侧：关键状态高亮显示
@@ -887,6 +931,114 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             // 目标地址
             ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "目标地址");
             ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%s", selected_target.c_str());
+            ImGui::Spacing();
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::InputText("##manual_ip", manual_ip_buffer, sizeof(manual_ip_buffer), ImGuiInputTextFlags_EnterReturnsTrue)) {
+                std::string entered(manual_ip_buffer);
+                size_t start = entered.find_first_not_of(" \t\r\n");
+                if (start != std::string::npos) {
+                    size_t end = entered.find_last_not_of(" \t\r\n");
+                    entered = entered.substr(start, end - start + 1);
+                } else {
+                    entered.clear();
+                }
+                sockaddr_in test_addr{};
+                if (!entered.empty() && inet_pton(AF_INET, entered.c_str(), &test_addr.sin_addr) == 1) {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.manual_target_ip = entered;
+                    network_state_.selected_target_index = 0;
+                    last_ui_event_ = Fmt("已设置手动目标 %s", entered.c_str());
+                } else if (!entered.empty()) {
+                    last_ui_event_ = "手动 IP 格式无效";
+                } else {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.manual_target_ip.clear();
+                    last_ui_event_ = "已清除手动目标，恢复广播";
+                }
+            }
+            // 手柄友好的快速 IP 调整（无需键盘输入）
+            {
+                static int edit_octet = 3; // 0~3 对应第 1~4 段
+                auto get_octets = [](const std::string& ip, int out[4]) -> bool {
+                    std::istringstream stream(ip);
+                    std::string part;
+                    int i = 0;
+                    while (std::getline(stream, part, '.') && i < 4) {
+                        out[i++] = std::atoi(part.c_str());
+                    }
+                    return i == 4;
+                };
+                auto base_ip_string = [&]() -> std::string {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    std::string base_ip = network_state_.manual_target_ip;
+                    if (base_ip.empty() && interface_info.valid) {
+                        std::string local = interface_info.local_ip;
+                        size_t last_dot = local.rfind('.');
+                        if (last_dot != std::string::npos) {
+                            base_ip = local.substr(0, last_dot) + ".100";
+                        }
+                    }
+                    return base_ip;
+                }();
+                auto apply_delta = [&](int delta) {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    std::string base_ip = network_state_.manual_target_ip;
+                    if (base_ip.empty() && interface_info.valid) {
+                        std::string local = interface_info.local_ip;
+                        size_t last_dot = local.rfind('.');
+                        if (last_dot != std::string::npos) {
+                            base_ip = local.substr(0, last_dot) + ".100";
+                        }
+                    }
+                    if (base_ip.empty()) return;
+                    int octets[4] = {0};
+                    if (!get_octets(base_ip, octets)) return;
+                    octets[edit_octet] += delta;
+                    if (octets[edit_octet] < 0) octets[edit_octet] = 0;
+                    if (octets[edit_octet] > 255) octets[edit_octet] = 255;
+                    network_state_.manual_target_ip = Fmt("%d.%d.%d.%d", octets[0], octets[1], octets[2], octets[3]);
+                    network_state_.selected_target_index = 0;
+                    last_ui_event_ = Fmt("已调整手动目标为 %s", network_state_.manual_target_ip.c_str());
+                    std::strncpy(manual_ip_buffer, network_state_.manual_target_ip.c_str(), sizeof(manual_ip_buffer) - 1);
+                    manual_ip_buffer[sizeof(manual_ip_buffer) - 1] = '\0';
+                };
+                auto switch_octet = [&](int delta) {
+                    edit_octet += delta;
+                    if (edit_octet < 0) edit_octet = 3;
+                    if (edit_octet > 3) edit_octet = 0;
+                };
+
+                std::string display_ip = base_ip_string;
+                if (display_ip.empty()) display_ip = "0.0.0.0";
+                int octets[4] = {0};
+                get_octets(display_ip, octets);
+                ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "编辑第 %d 段", edit_octet + 1);
+                for (int i = 0; i < 4; ++i) {
+                    if (i > 0) ImGui::SameLine();
+                    if (i == edit_octet) {
+                        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "%d", octets[i]);
+                    } else {
+                        ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 1.0f), "%d", octets[i]);
+                    }
+                    if (i < 3) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 1.0f), "."); }
+                }
+
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.90f, 0.90f, 0.92f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.80f, 0.80f, 0.85f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.70f, 0.70f, 0.78f, 1.0f));
+                if (ImGui::Button("<< 段", ImVec2(64, 40))) switch_octet(-1);
+                ImGui::SameLine();
+                if (ImGui::Button("-10", ImVec2(56, 40))) apply_delta(-10);
+                ImGui::SameLine();
+                if (ImGui::Button("-1", ImVec2(56, 40))) apply_delta(-1);
+                ImGui::SameLine();
+                if (ImGui::Button("+1", ImVec2(56, 40))) apply_delta(+1);
+                ImGui::SameLine();
+                if (ImGui::Button("+10", ImVec2(56, 40))) apply_delta(+10);
+                ImGui::SameLine();
+                if (ImGui::Button("段 >>", ImVec2(64, 40))) switch_octet(+1);
+                ImGui::PopStyleColor(3);
+            }
             ImGui::Separator();
 
             // 端口
@@ -1355,58 +1507,58 @@ void ControllerDiagnosticDemo::AddNetworkPanel() {
     network_window_->SetComponentTextColor(title_id, 0.38f, 0.90f, 0.96f, 1.0f);
 
     const int note_id = network_window_->AddText(
-            "Send robot-hand mapping data as JSON over UDP.\n"
-            "Scan the local subnet, pick a target, then stream without manual IP entry.", 24, 72);
+            "通过 UDP 以 JSON 格式发送机器人手部映射数据。\n"
+            "先扫描局域网，选中目标设备，然后开启 UDP 即可推流。", 24, 72);
     network_window_->SetComponentTextSize(note_id, 16);
     network_window_->SetComponentTextColor(note_id, 0.84f, 0.90f, 0.96f, 0.92f);
 
-    const int scan_button = network_window_->AddButton("Scan LAN", 24, 142, [&]() { StartLanScan(); });
+    const int scan_button = network_window_->AddButton("扫描局域网", 24, 142, [&]() { StartLanScan(); });
     network_window_->SetComponentSize(scan_button, 132, 46);
     network_window_->SetComponentBgColor(scan_button, 0.00f, 0.50f, 0.82f, 1.0f);
 
     const int prev_button =
-            network_window_->AddButton("Prev Target", 176, 142, [&]() { AdvanceSelectedLanTarget(-1); });
+            network_window_->AddButton("上个目标", 176, 142, [&]() { AdvanceSelectedLanTarget(-1); });
     network_window_->SetComponentSize(prev_button, 142, 46);
     network_window_->SetComponentBgColor(prev_button, 0.16f, 0.32f, 0.56f, 1.0f);
 
     const int next_button =
-            network_window_->AddButton("Next Target", 336, 142, [&]() { AdvanceSelectedLanTarget(1); });
+            network_window_->AddButton("下个目标", 336, 142, [&]() { AdvanceSelectedLanTarget(1); });
     network_window_->SetComponentSize(next_button, 142, 46);
     network_window_->SetComponentBgColor(next_button, 0.16f, 0.32f, 0.56f, 1.0f);
 
-    const int toggle_button = network_window_->AddButton("UDP On/Off", 496, 142, [&]() {
+    const int toggle_button = network_window_->AddButton("UDP 开关", 496, 142, [&]() {
         network_state_.udp_enabled = !network_state_.udp_enabled;
-        last_ui_event_ = Fmt("UDP streaming %s", network_state_.udp_enabled ? "enabled" : "disabled");
+        last_ui_event_ = Fmt("UDP 推流已%s", network_state_.udp_enabled ? "开启" : "关闭");
     });
     network_window_->SetComponentSize(toggle_button, 142, 46);
     network_window_->SetComponentBgColor(toggle_button, 0.02f, 0.62f, 0.44f, 1.0f);
 
-    const int send_once_button = network_window_->AddButton("Send Once", 24, 204, [&]() {
+    const int send_once_button = network_window_->AddButton("发送一帧", 24, 204, [&]() {
         network_state_.send_snapshot_requested = true;
-        last_ui_event_ = Fmt("Queued one UDP snapshot to %s", BuildSelectedTargetLabel().c_str());
+        last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
     });
     network_window_->SetComponentSize(send_once_button, 132, 44);
     network_window_->SetComponentBgColor(send_once_button, 0.60f, 0.38f, 0.02f, 1.0f);
 
-    const int port_down_button = network_window_->AddButton("Port -", 176, 204, [&]() {
+    const int port_down_button = network_window_->AddButton("端口 -", 176, 204, [&]() {
         if (network_state_.udp_port > 1024) {
             --network_state_.udp_port;
-            last_ui_event_ = Fmt("UDP port set to %u", static_cast<unsigned int>(network_state_.udp_port));
+            last_ui_event_ = Fmt("UDP 端口已设为 %u", static_cast<unsigned int>(network_state_.udp_port));
         }
     });
     network_window_->SetComponentSize(port_down_button, 100, 44);
     network_window_->SetComponentBgColor(port_down_button, 0.26f, 0.26f, 0.30f, 1.0f);
 
-    const int port_up_button = network_window_->AddButton("Port +", 292, 204, [&]() {
+    const int port_up_button = network_window_->AddButton("端口 +", 292, 204, [&]() {
         if (network_state_.udp_port < 65535) {
             ++network_state_.udp_port;
-            last_ui_event_ = Fmt("UDP port set to %u", static_cast<unsigned int>(network_state_.udp_port));
+            last_ui_event_ = Fmt("UDP 端口已设为 %u", static_cast<unsigned int>(network_state_.udp_port));
         }
     });
     network_window_->SetComponentSize(port_up_button, 100, 44);
     network_window_->SetComponentBgColor(port_up_button, 0.26f, 0.26f, 0.30f, 1.0f);
 
-    network_status_text_id_ = network_window_->AddText("Preparing network interface...", 24, 270);
+    network_status_text_id_ = network_window_->AddText("正在初始化网络接口...", 24, 270);
     network_window_->SetComponentTextSize(network_status_text_id_, 16);
     network_window_->SetComponentTextColor(network_status_text_id_, 0.94f, 0.98f, 1.0f, 1.0f);
 
@@ -1606,14 +1758,15 @@ std::vector<ControllerDiagnosticDemo::LanDeviceInfo> ControllerDiagnosticDemo::P
         return devices;
     }
 
-    const uint32_t network_prefix = interface_info.local_ip_host & interface_info.netmask_host;
-    const uint32_t broadcast_ip = interface_info.broadcast_ip_host;
+    // Always scan the /24 subnet that the local IP belongs to, regardless of netmask.
+    // This handles large /16 corporate networks where scanning the entire prefix is impractical.
+    const uint32_t network_prefix = interface_info.local_ip_host & 0xFFFFFF00u;
+    const uint32_t broadcast_ip = network_prefix | 0x000000FFu;
     if (broadcast_ip <= network_prefix + 1) {
         return devices;
     }
 
-    const uint32_t host_count = broadcast_ip - network_prefix - 1;
-    const uint32_t probe_count = std::min<uint32_t>(host_count, 254);
+    const uint32_t probe_count = 254u;
 
     const int probe_socket = socket(AF_INET, SOCK_DGRAM, 0);
     if (probe_socket >= 0) {
@@ -1688,6 +1841,9 @@ std::string ControllerDiagnosticDemo::BuildSelectedTargetLabel() const {
     std::lock_guard<std::mutex> lock(network_state_.device_mutex);
     if (network_state_.selected_target_index <= 0 ||
         network_state_.selected_target_index > static_cast<int>(network_state_.discovered_devices.size())) {
+        if (!network_state_.manual_target_ip.empty()) {
+            return Fmt("手动目标 (%s)", network_state_.manual_target_ip.c_str());
+        }
         return network_state_.interface_info.valid ? Fmt("广播 (%s)", network_state_.interface_info.broadcast_ip.c_str())
                                                    : "广播";
     }
@@ -1712,6 +1868,9 @@ bool ControllerDiagnosticDemo::ResolveSelectedTarget(sockaddr_in* out_addr) {
 
     if (network_state_.selected_target_index <= 0 ||
         network_state_.selected_target_index > static_cast<int>(network_state_.discovered_devices.size())) {
+        if (!network_state_.manual_target_ip.empty()) {
+            return inet_pton(AF_INET, network_state_.manual_target_ip.c_str(), &out_addr->sin_addr) == 1;
+        }
         out_addr->sin_addr.s_addr = htonl(network_state_.interface_info.broadcast_ip_host);
         return true;
     }
@@ -1720,39 +1879,35 @@ bool ControllerDiagnosticDemo::ResolveSelectedTarget(sockaddr_in* out_addr) {
                      &out_addr->sin_addr) == 1;
 }
 
+ControllerDiagnosticDemo::EulerDeg ControllerDiagnosticDemo::QuatToEuler(const XrQuaternionf& q) const {
+    const float sinr_cosp = 2.0f * (q.w * q.x + q.y * q.z);
+    const float cosr_cosp = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
+    const float roll = std::atan2(sinr_cosp, cosr_cosp);
+
+    const float sinp = 2.0f * (q.w * q.y - q.z * q.x);
+    float pitch = 0.0f;
+    if (std::abs(sinp) >= 1.0f) {
+        pitch = std::copysign(MATH_PI / 2.0f, sinp);
+    } else {
+        pitch = std::asin(sinp);
+    }
+
+    const float siny_cosp = 2.0f * (q.w * q.z + q.x * q.y);
+    const float cosy_cosp = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
+    const float yaw = std::atan2(siny_cosp, cosy_cosp);
+
+    constexpr float kRad2Deg = 180.0f / MATH_PI;
+    return EulerDeg{pitch * kRad2Deg, yaw * kRad2Deg, roll * kRad2Deg};
+}
+
 std::string ControllerDiagnosticDemo::BuildUdpPayloadJson(uint64_t sequence) const {
     (void)sequence;
-    struct EulerDeg {
-        float pitch;
-        float yaw;
-        float roll;
-    };
-    const auto quat_to_euler = [](const XrQuaternionf& q) -> EulerDeg {
-        const float sinr_cosp = 2.0f * (q.w * q.x + q.y * q.z);
-        const float cosr_cosp = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
-        const float roll = std::atan2(sinr_cosp, cosr_cosp);
-
-        const float sinp = 2.0f * (q.w * q.y - q.z * q.x);
-        float pitch = 0.0f;
-        if (std::abs(sinp) >= 1.0f) {
-            pitch = std::copysign(MATH_PI / 2.0f, sinp);
-        } else {
-            pitch = std::asin(sinp);
-        }
-
-        const float siny_cosp = 2.0f * (q.w * q.z + q.x * q.y);
-        const float cosy_cosp = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
-        const float yaw = std::atan2(siny_cosp, cosy_cosp);
-
-        constexpr float kRad2Deg = 180.0f / MATH_PI;
-        return EulerDeg{pitch * kRad2Deg, yaw * kRad2Deg, roll * kRad2Deg};
-    };
 
     const auto build_hand_json = [&](int hand) {
         const RobotHandMetrics metrics = ApplyCalibration(hand, ComputeRobotHandMetrics(hand));
         const auto& hand_state = hand_states_[hand];
         const bool palm_valid = metrics.spatial_valid;
-        const EulerDeg euler = quat_to_euler(hand_state.palm_pose.orientation);
+        const EulerDeg euler = QuatToEuler(hand_state.palm_pose.orientation);
 
         std::ostringstream stream;
         stream << "{\"hand\":\"" << (hand == Side::LEFT ? "left" : "right") << "\""
@@ -1780,9 +1935,9 @@ std::string ControllerDiagnosticDemo::BuildUdpPayloadJson(uint64_t sequence) con
         if (calibration.calibrated && calibration.zero_metrics.spatial_valid) {
             relative_pos = SubtractVector(pose.position, calibration.zero_metrics.palm_position);
         }
-        EulerDeg euler = quat_to_euler(pose.orientation);
+        EulerDeg euler = QuatToEuler(pose.orientation);
         if (calibration.calibrated && calibration.zero_metrics.spatial_valid) {
-            const EulerDeg zero_euler = quat_to_euler(calibration.zero_metrics.palm_orientation);
+            const EulerDeg zero_euler = QuatToEuler(calibration.zero_metrics.palm_orientation);
             euler.pitch -= zero_euler.pitch;
             euler.yaw   -= zero_euler.yaw;
             euler.roll  -= zero_euler.roll;
@@ -2276,19 +2431,39 @@ std::string ControllerDiagnosticDemo::BuildControllerText(int hand) const {
         return network_state_.udp_enabled;
     }();
 
+    const auto& calibration = hand_calibration_states_[hand];
+    XrVector3f relative_pos = grip_pose.position;
+    EulerDeg relative_euler = QuatToEuler(grip_pose.orientation);
+    if (calibration.calibrated && calibration.zero_metrics.spatial_valid) {
+        relative_pos = SubtractVector(grip_pose.position, calibration.zero_metrics.palm_position);
+        const EulerDeg zero_euler = QuatToEuler(calibration.zero_metrics.palm_orientation);
+        relative_euler.pitch -= zero_euler.pitch;
+        relative_euler.yaw   -= zero_euler.yaw;
+        relative_euler.roll  -= zero_euler.roll;
+        auto norm = [](float a) {
+            while (a > 180.0f) a -= 360.0f;
+            while (a < -180.0f) a += 360.0f;
+            return a;
+        };
+        relative_euler.pitch = norm(relative_euler.pitch);
+        relative_euler.yaw   = norm(relative_euler.yaw);
+        relative_euler.roll  = norm(relative_euler.roll);
+    }
+
     if (current_frame_in_.controller_actives[hand] != XR_TRUE) {
-        return Fmt("%s\n连接  未连接\n发送  %s\n扳机 %.2f  握把 %.2f\n电量 %.1f / 5\n摇杆 %.2f, %.2f\n%s", label,
+        return Fmt("%s\n连接  未连接\n发送  %s\n扳机 %.3f  握把 %.3f\n电量 %.1f / 5\n摇杆 %.3f, %.3f\n%s", label,
                    udp_enabled ? "持续发送中" : "空闲",
                    current_frame_in_.controller_trigger_value[hand],
                    current_frame_in_.controller_grip_value[hand], current_frame_in_.controller_battery_value[hand],
                    stick.x, stick.y, BuildButtonSummary(hand).c_str());
     }
 
-    return Fmt("%s\n连接  已连接\n发送  %s\n握持 %.2f, %.2f, %.2f\n指向 %.2f, %.2f, %.2f\n"
-               "扳机 %.2f  握把 %.2f\n电量 %.1f / 5  摇杆 %.2f, %.2f\n%s",
+    return Fmt("%s\n连接  已连接\n发送  %s\n相对位置 %.4f, %.4f, %.4f\n相对朝向 P%.3f Y%.3f R%.3f\n"
+               "扳机 %.3f  握把 %.3f\n电量 %.1f / 5  摇杆 %.3f, %.3f\n%s",
                label, udp_enabled ? "持续发送中" : "空闲",
-               grip_pose.position.x, grip_pose.position.y, grip_pose.position.z, aim_pose.position.x,
-               aim_pose.position.y, aim_pose.position.z, current_frame_in_.controller_trigger_value[hand],
+               relative_pos.x, relative_pos.y, relative_pos.z,
+               relative_euler.pitch, relative_euler.yaw, relative_euler.roll,
+               current_frame_in_.controller_trigger_value[hand],
                current_frame_in_.controller_grip_value[hand], current_frame_in_.controller_battery_value[hand], stick.x,
                stick.y, BuildButtonSummary(hand).c_str());
 }
@@ -2311,7 +2486,7 @@ std::string ControllerDiagnosticDemo::BuildHandText(int hand) const {
                    BuildHandGestureSummary(hand).c_str());
     }
 
-    return Fmt("%s\n连接  在线\n识别  已追踪\n手掌 %.2f, %.2f, %.2f\n%s",
+    return Fmt("%s\n连接  在线\n识别  已追踪\n手掌 %.4f, %.4f, %.4f\n%s",
                label, hand_state.palm_pose.position.x, hand_state.palm_pose.position.y, hand_state.palm_pose.position.z,
                BuildHandGestureSummary(hand).c_str());
 }
@@ -2437,7 +2612,7 @@ std::string ControllerDiagnosticDemo::BuildRobotMappingText(int hand) const {
         return valid ? Fmt("%.0f°", value) : std::string("无");
     };
 
-    return Fmt("%s映射\n状态  %s\n相对掌心 %.3f, %.3f, %.3f 米\n"
+    return Fmt("%s映射\n状态  %s\n相对掌心 %.4f, %.4f, %.4f 米\n"
                "拇指 X侧摆 %s  拇指 Y弯曲 %s\n食指 %s  中指 %s\n无名指 %s  小指 %s\n校准  %s",
                label, hand_states_[hand].active ? "手势在线" : "手柄回退",
                metrics.palm_position.x, metrics.palm_position.y, metrics.palm_position.z,
