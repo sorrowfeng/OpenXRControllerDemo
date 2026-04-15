@@ -55,6 +55,11 @@ namespace PVRSampleFW {
         need_render_ = true;
     }
 
+    void GuiWindow::SetCustomRenderCallback(GuiWindowCustomRenderCallback callback) {
+        custom_render_callback_ = std::move(callback);
+        need_render_ = true;
+    }
+
     int GuiWindow::AddButton(const char *name, std::function<void()> callback) {
         WindowComponentConfig config = {
                 .flags = 0,

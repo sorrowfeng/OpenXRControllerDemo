@@ -1,166 +1,525 @@
-# OpenXRControllerDemo Agent Progress
+# OpenXRControllerDemo Agent Handoff
 
-## 项目目标
+## 项目定位
 
-这是一个基于 PICO OpenXR Sample Framework 改出来的调试与控制应用，核心目标是：
+这是一个基于 PICO OpenXR Sample Framework 改造出来的头显内调试与控制应用。
 
-- 在头显中稳定显示 OpenXR 单窗口控制台
-- 同时展示手柄状态、手部追踪、灵巧手映射和局域网 UDP 联调信息
-- 保持和官方 Sample 一样的 OpenXR / Swapchain / 图形链路，避免“能编译但运行路径不一致”的问题
+当前目标不是做通用 UI Demo，而是做一个能在头显内稳定运行的单窗口控制台，用来同时完成这些事：
 
-## 当前结论
+- 查看左右手柄状态
+- 查看手部追踪状态与关键手势指标
+- 查看灵巧手/机械手映射数据
+- 通过局域网 UDP 把当前控制与手势数据发给外部设备
+- 在保持官方 Sample 渲染链路的前提下做 GUI，不要偏离 OpenXR / swapchain / graphics plugin 的真实运行路径
 
-### 1. 崩溃主因已经定位并修复过一轮
+## 接管前先看什么
 
-之前“经常闪退”不是普通逻辑错误，而是 native 层未定义行为和内存损坏。
+建议新 session 先读这几个文件：
 
-已修复的高风险点：
+1. `D:/Project/PICOProject/OpenXRControllerDemo/AGENTS.md`
+2. `D:/Project/PICOProject/OpenXRControllerDemo/app/src/main/cpp/main.cpp`
+3. `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/gui/ImGuiRenderer.cpp`
+4. `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/gui/GuiWindow.h`
+5. `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/gui/GuiWindow.cpp`
 
-- `framework/src/model/objects/TruncatedCone.cpp`
-  - 修复截锥体网格生成时的顶点/索引缓冲区错误
-  - 这是此前握着手柄后容易崩的直接高风险点之一
-- `framework/src/openxrWrapper/BasicOpenXrWrapper.cpp`
-  - 回避运行时某些控制器类型探测路径的危险调用
-- `framework/src/openxrWrapper/extensions/FBDisplayRefreshRates.cpp`
-  - 修复 `float` 按错误格式输出的问题
-  - 之前日志里异常的刷新率打印就是这个信号
+如果接手人准备动稳定性问题，再补读：
 
-### 2. GUI “整块黑板”问题已经定位并修复
+- `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/model/objects/TruncatedCone.cpp`
+- `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/openxrWrapper/BasicOpenXrWrapper.cpp`
+- `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/openxrWrapper/extensions/FBDisplayRefreshRates.cpp`
+- `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/graphicsPlugin/OpenGLESGraphicsPlugin.cpp`
 
-根因不是配色，而是 GUI 渲染链在实际运行路径里没有真正接上。
+## 当前架构
 
-已修复：
+### 1. 运行主线
 
-- `framework/src/graphicsPlugin/OpenGLESGraphicsPlugin.cpp`
-  - 在实际运行的 OpenGLES 图形插件里初始化 `ImGuiRenderer`
-  - 每帧触发 GUI 渲染
-  - 关闭图形设备时正确销毁 GUI 渲染器
+主业务基本都在：
 
-验证结果：
+- `D:/Project/PICOProject/OpenXRControllerDemo/app/src/main/cpp/main.cpp`
 
-- 应用可以进入首帧
-- 会话能进入 `XR_SESSION_STATE_FOCUSED`
-- 日志中已出现 GUI draw list / 顶点数 / 首帧完成等信息
+核心类：
 
-### 3. UI 已重构成“单窗口控制台”
+- `ControllerDiagnosticDemo : public AndroidOpenXrProgram`
 
-现在的主界面目标是：
+当前主循环相关方法：
 
-- 只保留正中一个主窗口
-- 左侧做导航感区域
-- 中间和右侧展示运行数据
-- 底部做常用操作按钮
+- `CustomizedSessionInit()`
+  - 初始化手部追踪
+  - 初始化网络发送
+  - 创建 GUI / 场景对象
+- `CustomizedPreRenderFrame()`
+  - 更新手柄可视化
+  - 更新手部追踪
+  - 更新手部骨架/关节可视化
+  - 更新校准状态
+  - 处理窗口拖动
+  - 处理输入事件
+  - 更新 UDP 发送
+- `CustomizedRender()`
+  - 走 OpenXR + graphics plugin 正常渲染路径
 
-主要实现文件：
+### 2. GUI 架构
 
-- `app/src/main/cpp/main.cpp`
+项目底层确实是 ImGui，但业务层不是直接在外面到处裸写 `ImGui::Begin()`。
 
-## 本轮 UI 进展
+目前是“两层结构”：
 
-### 已完成
+- 低层渲染：
+  - `framework/src/gui/ImGuiRenderer.cpp`
+- 业务窗口抽象：
+  - `framework/src/gui/GuiWindow.h`
+  - `framework/src/gui/GuiWindow.cpp`
 
-- 主窗口改成白底高对比风格
-- GUI 字体改为优先加载设备系统字体：
+这套结构当前已经扩展成支持两种模式：
+
+1. 旧模式：`AddText / AddButton / AddCheckBox`
+2. 新模式：给 `GuiWindow` 挂一个自定义 ImGui 绘制回调
+
+已新增能力：
+
+- `GuiWindow::SetCustomRenderCallback(...)`
+- `GuiWindow::GetCustomRenderCallback()`
+- `GuiWindow::SetButtonCallback(...)`
+
+`ImGuiRenderer.cpp` 里已经接好：
+
+- 如果某个 `GuiWindow` 挂了 `customRenderCallback`
+- 则在渲染该窗口时直接执行回调
+
+这意味着当前主控制台已经是“业务层原生 ImGui 布局 + 仍然走项目原本 GuiWindow/ImGuiRenderer/纹理平面渲染链”的模式。
+
+### 3. 主控制台 UI 架构
+
+当前主窗口入口：
+
+- `AddMainDashboard()`
+
+当前主窗口绘制入口：
+
+- `DrawDashboardImGui()`
+
+当前 dashboard 已经不再使用旧的静态 text/button id 拼接主界面。
+旧 dashboard 兼容逻辑已经清理过一轮，现在主面板主要依赖 `DrawDashboardImGui()`。
+
+主窗口布局结构：
+
+- 左侧：导航区
+- 顶部：状态 badge
+- 中部：按页面切换的卡片区
+- 底部：按页面切换的操作按钮区
+
+页面枚举：
+
+- `Overview`
+- `Controller`
+- `Hand`
+- `Network`
+- `Mapping`
+
+切页方法：
+
+- `SetDashboardSection(...)`
+
+### 4. 其他仍存在的旧面板
+
+这些旧窗口对象和对应 `UpdateText()` 更新逻辑还在：
+
+- `controller_window_`
+- `hand_window_`
+- `runtime_window_`
+- `robot_mapping_window_`
+- `network_window_`
+
+它们现在不是主交互入口，但相关文本构造函数仍然被复用：
+
+- `BuildControllerText(...)`
+- `BuildHandText(...)`
+- `BuildRobotMappingText(...)`
+- `BuildNetworkPanelText()`
+
+如果后续确认这些旧窗口已经完全不再展示，可以继续清理。
+但清理前要先确认没有别的平面或场景还在引用它们。
+
+## 已实现功能
+
+### 1. 中文 GUI 与字体
+
+相关文件：
+
+- `framework/src/gui/ImGuiRenderer.cpp`
+
+已做的事：
+
+- 优先尝试加载设备系统中文字体
   - `PICOSansSC-Regular.ttf`
   - `PICOSansSC-Medium.ttf`
   - `NotoSansCJK-Regular.ttc`
-- ImGui 字符集已切到：
+- ImGui 字符范围已切到：
   - `GetGlyphRangesChineseSimplifiedCommon()`
-- 已将主面板可见文案大部分切回中文
-- 已把 UI 缩放从过大的全局值调低，缓解按钮和文本被挤压的问题
-- 已将按钮文本对齐设为居中
-- 已扩大主窗口尺寸并放宽区块间距
-- 已对底部按钮和左侧导航按钮重新调尺寸
+- `ButtonTextAlign` 已设为居中
+- 全局 `ScaleAllSizes(...)` 已调整过
+- 预加载字体尺寸包括：
+  - `16, 20, 24, 28, 32, 36, 40`
 
-### 当前状态
+注意：
 
-代码层面已经完成以下调整：
+- 当前“能显示中文”这件事代码层已经打通
+- 但最终字号、行高、局部拥挤与否，仍然需要头显实机看效果
 
-- `framework/src/gui/ImGuiRenderer.cpp`
-  - 中文字库范围已启用
-  - 预加载字号已包含 `16, 20, 24, 28, 32, 36, 40`
-  - `ButtonTextAlign` 已设为居中
-  - `ScaleAllSizes` 已从此前过大的值下调
+### 2. 单窗口控制台
+
+相关文件：
+
 - `app/src/main/cpp/main.cpp`
-  - 主界面标题/导航/状态/网络/映射文案已大面积中文化
-  - 主窗口尺寸从旧版进一步放大
-  - 底部操作按钮已重排为更宽、更高的中文按钮
-  - 运行总览、手柄状态、手部追踪、网络工具、灵巧手映射都改成更适合单窗口的紧凑文案
 
-### 仍需用户在头显里最终确认
+当前页面含义：
 
-虽然构建、安装、运行都通过了，但下面两项仍需要佩戴头显后的真实视觉确认：
+- `总览`
+  - 运行摘要
+  - 输入摘要
+  - 网络摘要
+- `手柄`
+  - 左右手柄独立卡片
+  - 输入与联调摘要
+- `手部`
+  - 左右手追踪卡
+  - 手势与校准区
+- `网络`
+  - 连接状态
+  - 全量设备列表
+  - 发送内容与步骤
+- `映射`
+  - 左右手映射值
+  - 映射说明
 
-- 中文是否已经正常显示，不再变成问号或黑方块
-- 当前按钮、标题和分栏是否还有裁切、重叠或太小的问题
+当前使用的原生 ImGui 控件/布局方式包括：
 
-也就是说：
+- `Button`
+- `Columns`
+- `BeginChild`
+- `Separator`
+- `TextWrapped`
+- 滚动子区域
 
-- “代码和运行链路”已经通
-- “最终视觉效果”还差用户确认这一关
+### 3. 手柄状态与输入事件
 
-## 最近已验证的事实
+相关方法：
 
-本地构建与运行状态：
+- `BuildControllerText(int hand) const`
+- `BuildButtonSummary(int hand) const`
+- `DetectInputEvents()`
+- `PulseController(int hand)`
 
-- `assembleDebug` 构建通过
-- APK 已成功安装到设备
-- `com.example.openxrcontroller/android.app.NativeActivity` 进程可正常启动
-- 设备日志确认过：
-  - 中文字体文件成功加载
-  - GUI 已生成 draw list
-  - 应用进入 `First frame, completed`
-  - 会话进入 `XR_SESSION_STATE_FOCUSED`
+当前可显示/处理的信息：
 
-## 可直接运行的环境要求
+- 手柄是否连接
+- 握持位姿 / 指向位姿
+- 扳机值
+- 握把值
+- 电量
+- 摇杆值
+- 按键/触摸摘要
+- 最近输入事件
+- 左右手控制器震动按钮
 
-如果新 session 需要直接构建、安装、拉起应用，请先确认下面这些环境。
+### 4. 手部追踪与手势
 
-### 1. Java
+相关方法：
 
-当前工程可以直接使用 Android Studio 自带的 JBR。
+- `InitializeHandTracking()`
+- `UpdateHandTracking()`
+- `UpdateHandVisuals()`
+- `BuildHandText(int hand) const`
+- `BuildHandGestureSummary(int hand) const`
+- `ComputeThumbPinchStrength(...)`
 
-- `JAVA_HOME`
-  - `C:\Program Files\Android\Android Studio\jbr`
-- `PATH` 需要包含
-  - `%JAVA_HOME%\bin`
+当前手部追踪数据包括：
 
-PowerShell 可直接这样设置：
+- 手掌位置
+- 各关节位置
+- index tip pose
+- pinch:
+  - 食指
+  - 中指
+  - 无名指
+  - 小指
+- 追踪数据源状态
 
-```powershell
-$env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'
-$env:PATH="$env:JAVA_HOME\bin;$env:PATH"
-```
+当前手势摘要已经不是只看食指捏合了，而是会显示：
 
-如果没有这一步，常见现象就是：
+- 四指捏合百分比
+- 拇指 `thumb_x`
+- 拇指 `thumb_y`
+- 食指弯曲
+- 中指弯曲
+- 无名指弯曲
+- 小指弯曲
 
-- `JAVA_HOME` 没设
-- `java` 不在 `PATH`
-- 无法直接执行 `.\gradlew.bat assembleDebug`
+### 5. 灵巧手 / 机械手映射
 
-### 2. Android SDK / adb
+相关方法：
 
-当前机器上可用的 `adb` 路径是：
+- `ComputeRobotHandMetrics(int hand) const`
+- `ApplyCalibration(int hand, const RobotHandMetrics& raw_metrics) const`
+- `BuildRobotMappingText(int hand) const`
 
-- `C:\Users\plf\AppData\Local\Android\Sdk\platform-tools\adb.exe`
+当前映射关注值：
 
-如果不想改全局 `PATH`，可以直接用绝对路径执行。
+- `thumb_x`
+  - 语义：大拇指侧摆
+- `thumb_y`
+  - 语义：大拇指弯曲
+- `index_bend`
+- `middle_bend`
+- `ring_bend`
+- `little_bend`
+- `palm_position`
+  - 已支持作为相对空间位置输出
 
-### 3. 工作目录
+### 6. 校准逻辑
 
-所有命令默认在下面这个目录执行：
+相关方法：
 
-- `D:\Project\PICOProject\OpenXRControllerDemo`
+- `BeginHandCalibration()`
+- `ClearHandCalibration()`
+- `UpdateHandCalibration()`
+- `ApplyCalibration(...)`
+- `BuildCalibrationStatusText()`
+- `CalibrateControllerFallbackZero(int hand)`
 
-### 4. NDK 现状
+当前校准能力：
 
-当前工程可以正常构建，但 Gradle 会提示：
+- 点击“开始校准”后
+  - 等待手势上线
+  - 延迟 2 秒
+  - 把当前姿态记为零点
+- 校准内容包括：
+  - 掌心相对位置零点
+  - `thumb_x`
+  - `thumb_y`
+  - 四指弯曲角
+- 支持左右手分别校准
 
-- `ndk.dir` 的用法已过时
+当前还有一条“手柄回退校准”路径：
 
-这不是当前阻塞项，暂时不影响 `assembleDebug` 成功。
+- 当手柄已连接但手势未识别
+- 按下扳机时
+- 调用 `CalibrateControllerFallbackZero(hand)`
+- 将当前控制器位置作为零点
 
-## 一键常用命令
+### 7. UDP 网络联调
+
+相关方法：
+
+- `InitializeNetworkStreaming()`
+- `StartLanScan()`
+- `AdvanceSelectedLanTarget(int delta)`
+- `BuildSelectedTargetLabel()`
+- `ResolveSelectedTarget(...)`
+- `BuildUdpPayloadJson(uint64_t sequence) const`
+- `UpdateNetworkStreaming()`
+- `BuildNetworkPanelText()`
+
+当前网络侧能力：
+
+- 扫描局域网设备
+- 记录所有发现的 IP / MAC
+- 在 UI 中显示当前目标
+- 支持切换上一个/下一个目标
+- 支持广播目标
+- 支持持续 UDP 发送
+- 支持发送一帧 snapshot
+- UI 中显示：
+  - 是否已连接局域网
+  - 当前接口名
+  - 本机 IP
+  - 广播地址
+  - 端口
+  - 当前目标
+  - 扫描状态
+  - 已发包数量
+  - 设备总数
+
+网络页当前已经改成支持“全部设备滚动显示”。
+
+### 8. UDP JSON 输出内容
+
+相关方法：
+
+- `BuildUdpPayloadJson(...)`
+
+当前 JSON 已包含的关键内容：
+
+- frame / sequence 之类的基础字段
+- 左右手状态
+- 相对掌心位置
+- `thumb_x`
+- `thumb_y`
+- 兼容旧字段：
+  - `thumb_side`
+  - `thumb_bend`
+- 四指弯曲角
+- `calibrated`
+- `sending_by_trigger`
+
+### 9. 扳机发送逻辑
+
+相关方法：
+
+- `IsTriggerStreamingActive(int hand) const`
+- `DetectInputEvents()`
+- `UpdateNetworkStreaming()`
+
+当前行为：
+
+- 如果手势不在线，但手柄在线
+- 按下扳机会触发当前手的回退零点校准
+- 持续按住扳机时
+  - 会继续通过网络发送同款 JSON
+- UI 文案会显示：
+  - `扳机发送中`
+
+### 10. VR 中移动主窗口
+
+相关方法：
+
+- `UpdateDashboardDragging()`
+- `ResetPanelPose()`
+
+当前行为：
+
+- 通过握把键按住 + 移动控制器来拖动主窗口
+- 可以用“面板居中”动作把窗口重置
+
+### 11. 3D 可视化模型
+
+相关方法：
+
+- `CreateControllerModel(int hand)`
+- `UpdateControllerVisuals()`
+- `UpdateHandVisuals()`
+
+当前状态：
+
+- 手柄模型已经被简化过，不再是复杂模型
+- 手部骨架/关节还在显示
+- 指尖可视化已缩短/缩小过一轮，避免过长难看
+
+## 已知关键修复
+
+### 1. 稳定性修复
+
+不要轻易回滚这些文件的改动：
+
+- `framework/src/model/objects/TruncatedCone.cpp`
+  - 修过截锥体 mesh 生成问题
+- `framework/src/openxrWrapper/BasicOpenXrWrapper.cpp`
+  - 回避过运行时的危险控制器探测路径
+- `framework/src/openxrWrapper/extensions/FBDisplayRefreshRates.cpp`
+  - 修过错误格式化输出
+
+### 2. GUI 渲染链修复
+
+不要轻易回滚：
+
+- `framework/src/graphicsPlugin/OpenGLESGraphicsPlugin.cpp`
+
+这里已经接过：
+
+- ImGuiRenderer 初始化
+- 每帧 GUI 渲染触发
+- 关闭时销毁 renderer
+
+这部分是“黑板 UI 问题”能被彻底解决的关键。
+
+## 当前工作区状态
+
+截至本次交接，工作区有未提交改动：
+
+- `app/src/main/cpp/main.cpp`
+- `framework/src/gui/GuiWindow.cpp`
+- `framework/src/gui/GuiWindow.h`
+- `framework/src/gui/ImGuiRenderer.cpp`
+
+这些改动主要对应：
+
+- 原生 ImGui dashboard
+- GuiWindow 自定义渲染回调
+- 中文字体 / 缩放 / 对齐
+- dashboard 旧兼容逻辑清理
+
+注意：
+
+- 不要为了“回到干净状态”去误回滚这些文件
+- 当前这几处正是最新 UI 架构的核心
+
+## 当前已验证事实
+
+最近已经确认过：
+
+- `assembleDebug` 可以通过
+- APK 可以安装到设备
+- `NativeActivity` 可以被成功拉起
+- 之前的若干运行日志里出现过：
+  - 中文字体成功加载
+  - GUI draw list
+  - `First frame, completed`
+  - `XR_SESSION_STATE_FOCUSED`
+
+但要注意：
+
+- 最近一次 `adb shell am start -W ...` 虽然返回 `Status: ok`
+- 但后续没有稳定抓到进程和关键日志
+- 这更像是“启动请求成功，但是否真正留在沉浸式前台还需要头显现场确认”
+
+所以当前结论是：
+
+- 构建链路是通的
+- 安装链路是通的
+- 启动请求是通的
+- 但最新这版是否稳定留在前台，需要戴头显再看
+
+## 当前最可能继续要做的事
+
+### 优先级 1
+
+继续优化头显内实际 UI 效果：
+
+- 字号是否仍偏小
+- 某些页面是否仍有重叠
+- 卡片尺寸是否合理
+- 网络页设备列表是否足够清晰
+- 状态 badge 是否足够醒目
+
+### 优先级 2
+
+继续把页面完全做成“工具面板化”：
+
+- 更明显的连接状态
+- 更明显的发送状态
+- 更明显的校准状态
+- 更明显的手势在线/离线状态
+
+### 优先级 3
+
+如果确认旧窗口完全没用了，可以考虑继续清理：
+
+- `controller_window_`
+- `hand_window_`
+- `runtime_window_`
+- `robot_mapping_window_`
+- `network_window_`
+
+但在没有确认场景里完全不再挂这些平面前，不建议贸然删除。
+
+## 暂时不要做的事
+
+- 不要回滚前述稳定性修复
+- 不要改坏 OpenXR / graphics plugin 的真实渲染链路
+- 不要重新把 dashboard 改回大段静态 `AddText()` 布局
+- 不要在没有头显反馈的情况下盲目继续堆更多文本字段
+
+## 常用命令
 
 ### 构建 Debug APK
 
@@ -183,70 +542,31 @@ $env:PATH="$env:JAVA_HOME\bin;$env:PATH"
 & 'C:\Users\plf\AppData\Local\Android\Sdk\platform-tools\adb.exe' shell am start -W -a android.intent.action.MAIN -c org.khronos.openxr.intent.category.IMMERSIVE_HMD -n com.example.openxrcontroller/android.app.NativeActivity
 ```
 
-### 抓取关键日志
+### 查看设备
 
 ```powershell
-& 'C:\Users\plf\AppData\Local\Android\Sdk\platform-tools\adb.exe' shell logcat -d -t 400 | Select-String 'ImGuiRenderer loaded font|fallback to default font|GUI debug|First frame, completed|XR_SESSION_STATE_FOCUSED|Fatal signal|Runtime aborting' | ForEach-Object { $_.Line }
+& 'C:\Users\plf\AppData\Local\Android\Sdk\platform-tools\adb.exe' devices
 ```
 
-## 关键文件
+### 抓关键日志
 
-### 高优先级文件
+```powershell
+& 'C:\Users\plf\AppData\Local\Android\Sdk\platform-tools\adb.exe' shell logcat -d -t 500 | Select-String 'ImGuiRenderer loaded font|fallback to default font|GUI debug|First frame, completed|XR_SESSION_STATE_FOCUSED|Fatal signal|Runtime aborting|OpenXRControllerDemo|openxrcontroller' | ForEach-Object { $_.Line }
+```
 
-- `D:/Project/PICOProject/OpenXRControllerDemo/app/src/main/cpp/main.cpp`
-- `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/gui/ImGuiRenderer.cpp`
-- `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/graphicsPlugin/OpenGLESGraphicsPlugin.cpp`
+## 给下一个 Agent 的最短提示词
 
-### 之前的稳定性修复文件
+如果下一个 session 想最快接手，直接这样说：
 
-- `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/model/objects/TruncatedCone.cpp`
-- `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/openxrWrapper/BasicOpenXrWrapper.cpp`
-- `D:/Project/PICOProject/OpenXRControllerDemo/framework/src/openxrWrapper/extensions/FBDisplayRefreshRates.cpp`
+`请先阅读 D:/Project/PICOProject/OpenXRControllerDemo/AGENTS.md 和 D:/Project/PICOProject/OpenXRControllerDemo/app/src/main/cpp/main.cpp，然后继续接管这个项目。重点继续做头显里的单窗口控制台 UI、状态显示和实机运行验证，不要回滚已有稳定性修复。`
 
-## 当前工作区改动
+## 重要提醒
 
-截至写入本文件时，工作区里已有这些改动：
+`AGENTS.md` 只是交接入口，不会自动执行。
 
-- `app/src/main/cpp/main.cpp`
-- `framework/src/graphicsPlugin/OpenGLESGraphicsPlugin.cpp`
-- `framework/src/gui/ImGuiRenderer.cpp`
-- `framework/src/model/objects/TruncatedCone.cpp`
-- `framework/src/openxrWrapper/BasicOpenXrWrapper.cpp`
-- `framework/src/openxrWrapper/extensions/FBDisplayRefreshRates.cpp`
+新 session 必须明确告诉 Codex：
 
-注意：
+- 先读哪个文件
+- 然后按什么目标继续
 
-- 不要误回滚这些改动
-- 其中前 3 个主要是 GUI/显示链路
-- 后 3 个主要是稳定性修复
-
-## 下一步建议
-
-新 session 进来后，优先按这个顺序继续：
-
-1. 先读本文件，再读 `main.cpp` 和 `ImGuiRenderer.cpp`
-2. 确认用户提供的最新头显截图
-3. 只围绕“中文是否正常显示”和“按钮/文字是否仍被裁切”继续微调
-4. 如果中文仍异常，优先继续检查字体 atlas 和设备字体兼容性
-5. 如果中文正常但布局仍挤，继续收缩信息密度，不要再往主窗口里加更多调试字段
-
-## 新 Session 推荐提示词
-
-新开一个 Codex session 后，最省事的说法是：
-
-`请先阅读 D:/Project/PICOProject/OpenXRControllerDemo/AGENTS.md，然后接管这个项目，按文档里的当前进度继续处理 UI 显示问题。`
-
-如果你想更明确一点，可以直接这样说：
-
-`请先阅读 D:/Project/PICOProject/OpenXRControllerDemo/AGENTS.md 和 D:/Project/PICOProject/OpenXRControllerDemo/app/src/main/cpp/main.cpp，再继续处理头显里的中文显示和按钮裁切问题。不要回滚已有稳定性修复。`
-
-## 重要说明
-
-Codex 不会在“新 session 一打开”时自动执行某个 md 文件。
-
-你需要在新对话里明确告诉它：
-
-- 先读哪个 md
-- 读完后按什么目标继续做
-
-也就是说，`AGENTS.md` 是接管入口，不是自动启动脚本。
+否则它不会自动接着当前上下文往下做。

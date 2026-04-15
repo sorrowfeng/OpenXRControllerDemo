@@ -428,6 +428,11 @@ namespace PVRSampleFW {
             ImGui::TextWrapped("%s", config.text.c_str());
         }
 
+        const auto& customRenderCallback = window->GetCustomRenderCallback();
+        if (customRenderCallback) {
+            customRenderCallback();
+        }
+
         // 6. render components
         auto components = window->GetComponents();
         for (const auto &[id, component] : components) {

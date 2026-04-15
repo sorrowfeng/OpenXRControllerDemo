@@ -12,6 +12,7 @@
 #include "GuiPlane.h"
 #include "GuiWindow.h"
 #include "TruncatedCone.h"
+#include "imgui.h"
 #include "xr_linear.h"
 
 #include <android_native_app_glue.h>
@@ -432,10 +433,7 @@ private:
     void ResetPanelPose();
     void PulseController(int hand);
     void SetDashboardSection(DashboardSection section);
-    void RefreshDashboardNavigation();
-    void ConfigureDashboardActionButton(int slot, const char* label, std::function<void()> callback,
-                                        float r, float g, float b, float a, bool dark_text);
-    void RefreshDashboardActionButtons();
+    void DrawDashboardImGui();
     void BeginHandCalibration();
     void ClearHandCalibration();
     void UpdateHandCalibration();
@@ -485,28 +483,14 @@ private:
     std::shared_ptr<GuiPlane> robot_mapping_plane_;
     std::shared_ptr<GuiPlane> network_plane_;
 
-    int hero_summary_text_id_{-1};
-    int nav_overview_button_id_{-1};
-    int nav_controller_button_id_{-1};
-    int nav_hand_button_id_{-1};
-    int nav_network_button_id_{-1};
-    int nav_mapping_button_id_{-1};
-    std::array<int, 6> action_button_ids_{{-1, -1, -1, -1, -1, -1}};
     int left_controller_text_id_{-1};
     int right_controller_text_id_{-1};
     int left_hand_text_id_{-1};
     int right_hand_text_id_{-1};
-    int event_text_id_{-1};
-    int runtime_title_text_id_{-1};
     int runtime_text_id_{-1};
-    int controller_title_text_id_{-1};
-    int mapping_title_text_id_{-1};
     int left_robot_mapping_text_id_{-1};
     int right_robot_mapping_text_id_{-1};
-    int network_title_text_id_{-1};
     int network_status_text_id_{-1};
-    int hand_title_text_id_{-1};
-    int footer_hint_text_id_{-1};
 
     XrPosef dashboard_pose_{MakePose(0.0f, 0.06f, -1.18f)};
     XrPosef controller_pose_{MakePose(-0.52f, -0.18f, -1.26f)};
@@ -648,170 +632,404 @@ void ControllerDiagnosticDemo::AddMainDashboard() {
                                 .SetFontSize(24)
                                 .SetTextColor(0.02f, 0.02f, 0.02f, 1.0f)
                                 .Build();
-
-    const auto configure_nav_button = [&](int id, float r, float g, float b, float a, bool highlighted) {
-        dashboard_window_->SetComponentSize(id, 164, 62);
-        dashboard_window_->SetComponentTextSize(id, 26);
-        dashboard_window_->SetComponentBgColor(id, r, g, b, a);
-        if (highlighted) {
-            dashboard_window_->SetComponentTextColor(id, 1.0f, 1.0f, 1.0f, 1.0f);
-        } else {
-            dashboard_window_->SetComponentTextColor(id, 0.20f, 0.28f, 0.38f, 1.0f);
-        }
-    };
-
-    const auto configure_action_button = [&](int id, int x, int y, float r, float g, float b, float a, bool dark_text) {
-        dashboard_window_->SetComponentPos(id, x, y);
-        dashboard_window_->SetComponentSize(id, 208, 68);
-        dashboard_window_->SetComponentTextSize(id, 24);
-        dashboard_window_->SetComponentBgColor(id, r, g, b, a);
-        if (dark_text) {
-            dashboard_window_->SetComponentTextColor(id, 0.18f, 0.22f, 0.28f, 1.0f);
-        } else {
-            dashboard_window_->SetComponentTextColor(id, 1.0f, 1.0f, 1.0f, 1.0f);
-        }
-    };
-
-    const int title_id = dashboard_window_->AddText("OpenXR 控制台", 232, 34);
-    dashboard_window_->SetComponentTextSize(title_id, 40);
-    dashboard_window_->SetComponentTextColor(title_id, 0.08f, 0.12f, 0.18f, 1.0f);
-
-    const int subtitle_id = dashboard_window_->AddText(
-            "单窗口设备控制台，集中显示手柄状态、手部追踪、灵巧手映射和局域网联调。", 232, 86);
-    dashboard_window_->SetComponentTextSize(subtitle_id, 24);
-    dashboard_window_->SetComponentTextColor(subtitle_id, 0.28f, 0.38f, 0.50f, 1.0f);
-
-    const int nav_brand = dashboard_window_->AddText("导航", 44, 42);
-    dashboard_window_->SetComponentTextSize(nav_brand, 26);
-    dashboard_window_->SetComponentTextColor(nav_brand, 0.16f, 0.26f, 0.40f, 1.0f);
-
-    nav_overview_button_id_ =
-            dashboard_window_->AddButton("总览", 36, 110, [&]() { SetDashboardSection(DashboardSection::Overview); });
-    configure_nav_button(nav_overview_button_id_, 0.22f, 0.56f, 0.96f, 1.0f, true);
-
-    nav_controller_button_id_ = dashboard_window_->AddButton(
-            "手柄", 36, 188, [&]() { SetDashboardSection(DashboardSection::Controller); });
-    configure_nav_button(nav_controller_button_id_, 0.86f, 0.90f, 0.96f, 1.0f, false);
-
-    nav_hand_button_id_ =
-            dashboard_window_->AddButton("手部", 36, 266, [&]() { SetDashboardSection(DashboardSection::Hand); });
-    configure_nav_button(nav_hand_button_id_, 0.86f, 0.90f, 0.96f, 1.0f, false);
-
-    nav_network_button_id_ =
-            dashboard_window_->AddButton("网络", 36, 344, [&]() { SetDashboardSection(DashboardSection::Network); });
-    configure_nav_button(nav_network_button_id_, 0.86f, 0.90f, 0.96f, 1.0f, false);
-
-    nav_mapping_button_id_ =
-            dashboard_window_->AddButton("映射", 36, 422, [&]() { SetDashboardSection(DashboardSection::Mapping); });
-    configure_nav_button(nav_mapping_button_id_, 0.86f, 0.90f, 0.96f, 1.0f, false);
-
-    const int nav_hint = dashboard_window_->AddText(
-            "左侧用于功能导航\n右侧显示实时状态\n整体风格：设备上位机", 42, 532);
-    dashboard_window_->SetComponentTextSize(nav_hint, 18);
-    dashboard_window_->SetComponentTextColor(nav_hint, 0.34f, 0.44f, 0.56f, 1.0f);
-
-    hero_summary_text_id_ = dashboard_window_->AddText("正在初始化运行时状态...", 232, 136);
-    dashboard_window_->SetComponentTextSize(hero_summary_text_id_, 32);
-    dashboard_window_->SetComponentTextColor(hero_summary_text_id_, 0.08f, 0.24f, 0.48f, 1.0f);
-
-    event_text_id_ = dashboard_window_->AddText("最近事件：等待输入", 232, 172);
-    dashboard_window_->SetComponentTextSize(event_text_id_, 22);
-    dashboard_window_->SetComponentTextColor(event_text_id_, 0.00f, 0.46f, 0.72f, 1.0f);
-
-    runtime_title_text_id_ = dashboard_window_->AddText("运行总览", 232, 238);
-    dashboard_window_->SetComponentTextSize(runtime_title_text_id_, 32);
-    dashboard_window_->SetComponentTextColor(runtime_title_text_id_, 0.08f, 0.12f, 0.18f, 1.0f);
-    runtime_text_id_ = dashboard_window_->AddText("等待运行时状态...", 232, 282);
-    dashboard_window_->SetComponentTextSize(runtime_text_id_, 24);
-    dashboard_window_->SetComponentTextColor(runtime_text_id_, 0.10f, 0.14f, 0.20f, 1.0f);
-
-    controller_title_text_id_ = dashboard_window_->AddText("手柄状态", 796, 238);
-    dashboard_window_->SetComponentTextSize(controller_title_text_id_, 32);
-    dashboard_window_->SetComponentTextColor(controller_title_text_id_, 0.08f, 0.12f, 0.18f, 1.0f);
-    left_controller_text_id_ = dashboard_window_->AddText("正在加载手柄数据...", 796, 282);
-    dashboard_window_->SetComponentTextSize(left_controller_text_id_, 24);
-    dashboard_window_->SetComponentTextColor(left_controller_text_id_, 0.10f, 0.14f, 0.20f, 1.0f);
-
-    mapping_title_text_id_ = dashboard_window_->AddText("灵巧手映射", 1288, 238);
-    dashboard_window_->SetComponentTextSize(mapping_title_text_id_, 32);
-    dashboard_window_->SetComponentTextColor(mapping_title_text_id_, 0.08f, 0.12f, 0.18f, 1.0f);
-    left_robot_mapping_text_id_ = dashboard_window_->AddText("正在准备左手映射...", 1288, 282);
-    dashboard_window_->SetComponentTextSize(left_robot_mapping_text_id_, 24);
-    dashboard_window_->SetComponentTextColor(left_robot_mapping_text_id_, 0.00f, 0.46f, 0.72f, 1.0f);
-    right_robot_mapping_text_id_ = dashboard_window_->AddText("正在准备右手映射...", 1288, 650);
-    dashboard_window_->SetComponentTextSize(right_robot_mapping_text_id_, 24);
-    dashboard_window_->SetComponentTextColor(right_robot_mapping_text_id_, 0.70f, 0.34f, 0.00f, 1.0f);
-
-    network_title_text_id_ = dashboard_window_->AddText("网络工具", 232, 626);
-    dashboard_window_->SetComponentTextSize(network_title_text_id_, 32);
-    dashboard_window_->SetComponentTextColor(network_title_text_id_, 0.08f, 0.12f, 0.18f, 1.0f);
-    network_status_text_id_ = dashboard_window_->AddText("正在准备网络接口...", 232, 670);
-    dashboard_window_->SetComponentTextSize(network_status_text_id_, 24);
-    dashboard_window_->SetComponentTextColor(network_status_text_id_, 0.10f, 0.14f, 0.20f, 1.0f);
-
-    hand_title_text_id_ = dashboard_window_->AddText("手部追踪", 796, 626);
-    dashboard_window_->SetComponentTextSize(hand_title_text_id_, 32);
-    dashboard_window_->SetComponentTextColor(hand_title_text_id_, 0.08f, 0.12f, 0.18f, 1.0f);
-    right_controller_text_id_ = dashboard_window_->AddText("正在加载手部数据...", 796, 670);
-    dashboard_window_->SetComponentTextSize(right_controller_text_id_, 24);
-    dashboard_window_->SetComponentTextColor(right_controller_text_id_, 0.10f, 0.14f, 0.20f, 1.0f);
-
-    footer_hint_text_id_ = dashboard_window_->AddText(
-            "建议流程：先确认输入状态，再扫描局域网、切换目标，最后开启 UDP 推流。", 232, 954);
-    dashboard_window_->SetComponentTextSize(footer_hint_text_id_, 22);
-    dashboard_window_->SetComponentTextColor(footer_hint_text_id_, 0.28f, 0.38f, 0.50f, 1.0f);
-
-    action_button_ids_[0] = dashboard_window_->AddButton("动作 1", 232, 1002, []() {});
-    configure_action_button(action_button_ids_[0], 232, 1002, 0.22f, 0.56f, 0.96f, 1.0f, false);
-    action_button_ids_[1] = dashboard_window_->AddButton("动作 2", 452, 1002, []() {});
-    configure_action_button(action_button_ids_[1], 452, 1002, 0.16f, 0.66f, 0.86f, 1.0f, false);
-    action_button_ids_[2] = dashboard_window_->AddButton("动作 3", 672, 1002, []() {});
-    configure_action_button(action_button_ids_[2], 672, 1002, 0.82f, 0.87f, 0.94f, 1.0f, true);
-    action_button_ids_[3] = dashboard_window_->AddButton("动作 4", 892, 1002, []() {});
-    configure_action_button(action_button_ids_[3], 892, 1002, 0.82f, 0.87f, 0.94f, 1.0f, true);
-    action_button_ids_[4] = dashboard_window_->AddButton("动作 5", 1112, 1002, []() {});
-    configure_action_button(action_button_ids_[4], 1112, 1002, 0.18f, 0.72f, 0.52f, 1.0f, false);
-    action_button_ids_[5] = dashboard_window_->AddButton("动作 6", 1332, 1002, []() {});
-    configure_action_button(action_button_ids_[5], 1332, 1002, 0.96f, 0.68f, 0.20f, 1.0f, true);
+    dashboard_window_->SetCustomRenderCallback([this]() { DrawDashboardImGui(); });
 
     dashboard_plane_ = std::make_shared<GuiPlane>(dashboard_pose_, XrVector3f{1.72f, 1.12f, 1.0f}, dashboard_window_);
     dashboard_plane_->SetRenderDepthable(false);
     gui_scene.AddObject(dashboard_plane_);
-
-    RefreshDashboardNavigation();
-    RefreshDashboardActionButtons();
 }
 
-void ControllerDiagnosticDemo::RefreshDashboardNavigation() {
-    if (dashboard_window_ == nullptr) {
-        return;
+void ControllerDiagnosticDemo::DrawDashboardImGui() {
+    LanInterfaceInfo interface_info;
+    std::vector<LanDeviceInfo> devices;
+    bool udp_enabled = false;
+    bool scan_in_progress = false;
+    bool send_snapshot_requested = false;
+    uint16_t udp_port = 0;
+    uint64_t packet_sequence = 0;
+    int selected_target_index = 0;
+    std::string scan_status;
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        interface_info = network_state_.interface_info;
+        devices = network_state_.discovered_devices;
+        udp_enabled = network_state_.udp_enabled;
+        scan_in_progress = network_state_.scan_in_progress;
+        send_snapshot_requested = network_state_.send_snapshot_requested;
+        udp_port = network_state_.udp_port;
+        packet_sequence = network_state_.packet_sequence;
+        selected_target_index = network_state_.selected_target_index;
+        scan_status = network_state_.scan_status;
     }
 
-    const auto apply_style = [&](int component_id, bool highlighted) {
-        if (component_id < 0) {
-            return;
-        }
+    const bool trigger_streaming =
+            IsTriggerStreamingActive(Side::LEFT) || IsTriggerStreamingActive(Side::RIGHT);
+    const int active_controllers =
+            static_cast<int>(current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE) +
+            static_cast<int>(current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE);
+    const int active_hands =
+            static_cast<int>(hand_states_[Side::LEFT].active) + static_cast<int>(hand_states_[Side::RIGHT].active);
+    const std::string selected_target = BuildSelectedTargetLabel();
 
-        if (highlighted) {
-            dashboard_window_->SetComponentBgColor(component_id, 0.22f, 0.56f, 0.96f, 1.0f);
-            dashboard_window_->SetComponentTextColor(component_id, 1.0f, 1.0f, 1.0f, 1.0f);
-        } else {
-            dashboard_window_->SetComponentBgColor(component_id, 0.86f, 0.90f, 0.96f, 1.0f);
-            dashboard_window_->SetComponentTextColor(component_id, 0.20f, 0.28f, 0.38f, 1.0f);
+    const auto section_label = [](DashboardSection section) {
+        switch (section) {
+            case DashboardSection::Overview: return "总览";
+            case DashboardSection::Controller: return "手柄";
+            case DashboardSection::Hand: return "手部";
+            case DashboardSection::Network: return "网络";
+            case DashboardSection::Mapping: return "映射";
         }
+        return "总览";
     };
 
-    apply_style(nav_overview_button_id_, dashboard_section_ == DashboardSection::Overview);
-    apply_style(nav_controller_button_id_, dashboard_section_ == DashboardSection::Controller);
-    apply_style(nav_hand_button_id_, dashboard_section_ == DashboardSection::Hand);
-    apply_style(nav_network_button_id_, dashboard_section_ == DashboardSection::Network);
-    apply_style(nav_mapping_button_id_, dashboard_section_ == DashboardSection::Mapping);
+    const auto draw_status_badge = [](const char* label, const char* value, const ImVec4& color, float width) {
+        ImGui::PushStyleColor(ImGuiCol_Button, color);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, color);
+        ImGui::Button(label, ImVec2(width, 0.0f));
+        ImGui::PopStyleColor(3);
+        ImGui::TextWrapped("%s", value);
+    };
+
+    const auto draw_card = [](const char* title, const ImVec2& size, const std::function<void()>& body) {
+        ImGui::BeginChild(title, size, true, ImGuiWindowFlags_NoScrollbar);
+        ImGui::TextColored(ImVec4(0.08f, 0.12f, 0.18f, 1.0f), "%s", title);
+        ImGui::Separator();
+        body();
+        ImGui::EndChild();
+    };
+
+    const auto draw_action_button = [](const char* label, const ImVec4& color, const std::function<void()>& action,
+                                       float height = 56.0f) {
+        ImGui::PushStyleColor(ImGuiCol_Button, color);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(color.x + 0.05f, color.y + 0.05f, color.z + 0.05f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, color);
+        if (ImGui::Button(label, ImVec2(-1.0f, height))) {
+            action();
+        }
+        ImGui::PopStyleColor(3);
+    };
+
+    const auto draw_big_text = [](const std::string& text) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextUnformatted(text.c_str());
+        ImGui::PopTextWrapPos();
+    };
+
+    const auto draw_nav_button = [&](DashboardSection section) {
+        const bool selected = dashboard_section_ == section;
+        ImGui::PushStyleColor(ImGuiCol_Button,
+                              selected ? ImVec4(0.22f, 0.56f, 0.96f, 1.0f) : ImVec4(0.86f, 0.90f, 0.96f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                              selected ? ImVec4(0.30f, 0.62f, 0.98f, 1.0f) : ImVec4(0.78f, 0.84f, 0.92f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              selected ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : ImVec4(0.20f, 0.28f, 0.38f, 1.0f));
+        if (ImGui::Button(section_label(section), ImVec2(-1.0f, 64.0f))) {
+            SetDashboardSection(section);
+        }
+        ImGui::PopStyleColor(3);
+    };
+
+    const auto draw_controller_actions = [&]() {
+        draw_action_button("左手震动", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() { PulseController(Side::LEFT); }, 52.0f);
+        draw_action_button("右手震动", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() { PulseController(Side::RIGHT); }, 52.0f);
+    };
+
+    const auto draw_common_actions = [&]() {
+        draw_action_button("面板居中", ImVec4(0.22f, 0.56f, 0.96f, 1.0f), [&]() { ResetPanelPose(); }, 52.0f);
+        draw_action_button("开始校准", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { BeginHandCalibration(); }, 52.0f);
+        draw_action_button("扫描局域网", ImVec4(0.16f, 0.66f, 0.86f, 1.0f), [&]() { StartLanScan(); }, 52.0f);
+    };
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(16.0f, 16.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 16.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 18.0f);
+
+    ImGui::BeginChild("sidebar", ImVec2(196.0f, 0.0f), false);
+    ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "导航");
+    ImGui::Spacing();
+    draw_nav_button(DashboardSection::Overview);
+    draw_nav_button(DashboardSection::Controller);
+    draw_nav_button(DashboardSection::Hand);
+    draw_nav_button(DashboardSection::Network);
+    draw_nav_button(DashboardSection::Mapping);
+    ImGui::Spacing();
+    draw_status_badge("拖动窗口", dashboard_drag_active_ ? "抓握移动中" : "按住握把再移动", ImVec4(0.92f, 0.94f, 0.98f, 1.0f), -1.0f);
+    ImGui::TextWrapped("抓握键按住后移动控制器，可以拖动整块窗口。");
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+
+    ImGui::BeginChild("content", ImVec2(0, 0), false);
+    ImGui::TextColored(ImVec4(0.08f, 0.12f, 0.18f, 1.0f), "OpenXR 控制台");
+    ImGui::TextColored(ImVec4(0.38f, 0.44f, 0.52f, 1.0f), "当前页面：%s", section_label(dashboard_section_));
+    ImGui::Separator();
+
+    ImGui::Columns(4, "top_badges", false);
+    draw_status_badge("最近事件", last_ui_event_.c_str(), ImVec4(0.82f, 0.91f, 1.0f, 1.0f), -1.0f);
+    ImGui::NextColumn();
+    draw_status_badge("手追状态", hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str(),
+                      hand_tracking_ready_ ? ImVec4(0.72f, 0.92f, 0.80f, 1.0f) : ImVec4(1.0f, 0.84f, 0.72f, 1.0f), -1.0f);
+    ImGui::NextColumn();
+    draw_status_badge("发送状态", trigger_streaming ? "扳机发送中" : (udp_enabled ? "持续发送中" : "空闲"),
+                      trigger_streaming ? ImVec4(0.62f, 0.92f, 0.72f, 1.0f)
+                                        : (udp_enabled ? ImVec4(0.72f, 0.88f, 1.0f, 1.0f)
+                                                       : ImVec4(0.90f, 0.90f, 0.92f, 1.0f)),
+                      -1.0f);
+    ImGui::NextColumn();
+    draw_status_badge("连接状态", interface_info.valid ? "局域网已连接" : "局域网未连接",
+                      interface_info.valid ? ImVec4(0.76f, 0.93f, 0.82f, 1.0f) : ImVec4(1.0f, 0.88f, 0.80f, 1.0f), -1.0f);
+    ImGui::Columns(1);
+
+    ImGui::Spacing();
+
+    if (dashboard_section_ == DashboardSection::Overview) {
+        ImGui::BeginChild("overview_grid", ImVec2(0, -170.0f), false);
+        ImGui::Columns(3, "overview_cols", false);
+        draw_card("运行总览", ImVec2(0, 300.0f), [&]() {
+            draw_big_text(Fmt("当前帧  %lld\n预测显示  %.3f 秒\n在线手柄  %d / 2\n在线手部  %d / 2\n"
+                              "手追扩展  %s\n追踪器  %s",
+                              static_cast<long long>(current_frame_in_.frame_number),
+                              SecondsFromXrTime(current_frame_in_.predicted_display_time),
+                              active_controllers, active_hands,
+                              hand_tracking_supported_ ? "已启用" : "缺失",
+                              hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str()));
+        });
+        ImGui::NextColumn();
+        draw_card("输入摘要", ImVec2(0, 300.0f), [&]() {
+            draw_big_text(Fmt("左手柄  %s\n扳机 %.2f  握把 %.2f\n\n右手柄  %s\n扳机 %.2f  握把 %.2f\n\n%s",
+                              current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE ? "在线" : "离线",
+                              current_frame_in_.controller_trigger_value[Side::LEFT],
+                              current_frame_in_.controller_grip_value[Side::LEFT],
+                              current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE ? "在线" : "离线",
+                              current_frame_in_.controller_trigger_value[Side::RIGHT],
+                              current_frame_in_.controller_grip_value[Side::RIGHT],
+                              BuildCalibrationStatusText().c_str()));
+        });
+        ImGui::NextColumn();
+        draw_card("网络摘要", ImVec2(0, 300.0f), [&]() {
+            draw_big_text(Fmt("接口  %s\n本机  %s\n目标  %s\n端口  %u\n设备数  %d\n发送  %s",
+                              interface_info.interface_name.empty() ? "未找到" : interface_info.interface_name.c_str(),
+                              interface_info.local_ip.empty() ? "无" : interface_info.local_ip.c_str(),
+                              selected_target.c_str(), static_cast<unsigned int>(udp_port),
+                              static_cast<int>(devices.size()),
+                              trigger_streaming ? "扳机发送中" : (udp_enabled ? "持续发送中" : "空闲")));
+        });
+        ImGui::Columns(1);
+        ImGui::EndChild();
+    } else if (dashboard_section_ == DashboardSection::Controller) {
+        ImGui::BeginChild("controller_grid", ImVec2(0, -170.0f), false);
+        ImGui::Columns(3, "controller_cols", false);
+        draw_card("左手柄", ImVec2(0, 420.0f), [&]() { draw_big_text(BuildControllerText(Side::LEFT)); });
+        ImGui::NextColumn();
+        draw_card("右手柄", ImVec2(0, 420.0f), [&]() { draw_big_text(BuildControllerText(Side::RIGHT)); });
+        ImGui::NextColumn();
+        draw_card("输入与联调", ImVec2(0, 420.0f), [&]() {
+            draw_big_text(Fmt("左手输入\n%s\n\n右手输入\n%s\n\n当前目标\n%s",
+                              BuildButtonSummary(Side::LEFT).c_str(),
+                              BuildButtonSummary(Side::RIGHT).c_str(),
+                              selected_target.c_str()));
+        });
+        ImGui::Columns(1);
+        ImGui::EndChild();
+    } else if (dashboard_section_ == DashboardSection::Hand) {
+        ImGui::BeginChild("hand_grid", ImVec2(0, -170.0f), false);
+        ImGui::Columns(2, "hand_cols", false);
+        draw_card("左手追踪", ImVec2(0, 430.0f), [&]() { draw_big_text(BuildHandText(Side::LEFT)); });
+        ImGui::NextColumn();
+        draw_card("右手追踪", ImVec2(0, 430.0f), [&]() { draw_big_text(BuildHandText(Side::RIGHT)); });
+        ImGui::Columns(1);
+        draw_card("手势与校准", ImVec2(0, 0), [&]() {
+            ImGui::Columns(2, "gesture_cols", false);
+            draw_big_text(Fmt("左手手势\n%s", BuildHandGestureSummary(Side::LEFT).c_str()));
+            ImGui::NextColumn();
+            draw_big_text(Fmt("右手手势\n%s", BuildHandGestureSummary(Side::RIGHT).c_str()));
+            ImGui::Columns(1);
+            ImGui::Separator();
+            draw_big_text(BuildCalibrationStatusText());
+        });
+        ImGui::EndChild();
+    } else if (dashboard_section_ == DashboardSection::Mapping) {
+        ImGui::BeginChild("mapping_grid", ImVec2(0, -170.0f), false);
+        ImGui::Columns(2, "mapping_cols", false);
+        draw_card("左手映射", ImVec2(0, 430.0f), [&]() { draw_big_text(BuildRobotMappingText(Side::LEFT)); });
+        ImGui::NextColumn();
+        draw_card("右手映射", ImVec2(0, 430.0f), [&]() { draw_big_text(BuildRobotMappingText(Side::RIGHT)); });
+        ImGui::Columns(1);
+        draw_card("映射说明", ImVec2(0, 0), [&]() {
+            draw_big_text("当前映射重点\n拇指 X 侧摆\n拇指 Y 弯曲\n食指/中指/无名指/小指弯曲\n\n"
+                          "校准后掌心位置和角度都会以当前姿态作为 0 点。");
+        });
+        ImGui::EndChild();
+    } else {
+        ImGui::BeginChild("network_grid", ImVec2(0, -170.0f), false);
+        ImGui::Columns(2, "network_cols", false);
+        draw_card("连接状态", ImVec2(0, 430.0f), [&]() {
+            draw_big_text(Fmt("连接  %s\n发送  %s\n接口  %s\n本机  %s\n广播  %s\n扫描  %s\n已发包  %llu",
+                              interface_info.valid ? "已连接局域网" : "未连接局域网",
+                              trigger_streaming ? "扳机发送中" : (udp_enabled ? "持续发送中" : "空闲"),
+                              interface_info.interface_name.empty() ? "未找到" : interface_info.interface_name.c_str(),
+                              interface_info.local_ip.empty() ? "无" : interface_info.local_ip.c_str(),
+                              interface_info.broadcast_ip.empty() ? "无" : interface_info.broadcast_ip.c_str(),
+                              scan_in_progress ? "扫描中" : scan_status.c_str(),
+                              static_cast<unsigned long long>(packet_sequence)));
+        });
+        ImGui::NextColumn();
+        draw_card("全部设备", ImVec2(0, 430.0f), [&]() {
+            ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 1.0f), "当前目标：%s", selected_target.c_str());
+            ImGui::Separator();
+            ImGui::BeginChild("device_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+            if (devices.empty()) {
+                ImGui::TextWrapped("暂无可用 IP，请先扫描局域网。");
+            } else {
+                for (size_t index = 0; index < devices.size(); ++index) {
+                    const bool selected = static_cast<int>(index + 1) == selected_target_index;
+                    ImGui::TextColored(selected ? ImVec4(0.10f, 0.45f, 0.82f, 1.0f) : ImVec4(0.18f, 0.22f, 0.28f, 1.0f),
+                                       "%s%zu. %s  %s",
+                                       selected ? "> " : "  ", index + 1,
+                                       devices[index].ip.c_str(), devices[index].mac.c_str());
+                }
+            }
+            ImGui::EndChild();
+        });
+        ImGui::Columns(1);
+        draw_card("发送内容与步骤", ImVec2(0, 0), [&]() {
+            draw_big_text(Fmt("发送字段\nframe=%lld\nleft_controller=%s\nright_controller=%s\nleft_hand=%s\nright_hand=%s\n"
+                              "send_snapshot=%s\n\n步骤\n1. 扫描局域网\n2. 切目标\n3. 发送一帧\n4. 再开持续 UDP",
+                              static_cast<long long>(current_frame_in_.frame_number),
+                              current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE ? "online" : "offline",
+                              current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE ? "online" : "offline",
+                              hand_states_[Side::LEFT].active ? "online" : "offline",
+                              hand_states_[Side::RIGHT].active ? "online" : "offline",
+                              send_snapshot_requested ? "yes" : "no"));
+        });
+        ImGui::EndChild();
+    }
+
+    ImGui::SameLine();
+    ImGui::Separator();
+    ImGui::BeginChild("actions", ImVec2(0, 132.0f), false);
+    ImGui::Columns(6, "action_cols", false);
+    switch (dashboard_section_) {
+        case DashboardSection::Overview:
+            draw_common_actions();
+            ImGui::NextColumn();
+            draw_controller_actions();
+            ImGui::NextColumn();
+            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() {
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.send_snapshot_requested = true;
+                }
+                last_ui_event_ = Fmt("已排队发送一帧到 %s", selected_target.c_str());
+            });
+            break;
+        case DashboardSection::Controller:
+            draw_controller_actions();
+            ImGui::NextColumn();
+            draw_action_button("切到网络", ImVec4(0.16f, 0.66f, 0.86f, 1.0f), [&]() { SetDashboardSection(DashboardSection::Network); });
+            ImGui::NextColumn();
+            draw_action_button("面板居中", ImVec4(0.22f, 0.56f, 0.96f, 1.0f), [&]() { ResetPanelPose(); });
+            ImGui::NextColumn();
+            draw_action_button("开始校准", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { BeginHandCalibration(); });
+            ImGui::NextColumn();
+            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() {
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.send_snapshot_requested = true;
+                }
+                last_ui_event_ = Fmt("已排队发送一帧到 %s", selected_target.c_str());
+            });
+            break;
+        case DashboardSection::Hand:
+            draw_action_button("开始校准", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { BeginHandCalibration(); });
+            ImGui::NextColumn();
+            draw_action_button("清除校准", ImVec4(0.84f, 0.88f, 0.93f, 1.0f), [&]() { ClearHandCalibration(); });
+            ImGui::NextColumn();
+            draw_action_button("切到映射", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() { SetDashboardSection(DashboardSection::Mapping); });
+            ImGui::NextColumn();
+            draw_action_button("扫描局域网", ImVec4(0.16f, 0.66f, 0.86f, 1.0f), [&]() { StartLanScan(); });
+            ImGui::NextColumn();
+            draw_action_button("面板居中", ImVec4(0.22f, 0.56f, 0.96f, 1.0f), [&]() { ResetPanelPose(); });
+            break;
+        case DashboardSection::Network:
+            draw_action_button("扫描局域网", ImVec4(0.16f, 0.66f, 0.86f, 1.0f), [&]() { StartLanScan(); });
+            ImGui::NextColumn();
+            draw_action_button("上个目标", ImVec4(0.84f, 0.88f, 0.93f, 1.0f), [&]() { AdvanceSelectedLanTarget(-1); });
+            ImGui::NextColumn();
+            draw_action_button("下个目标", ImVec4(0.84f, 0.88f, 0.93f, 1.0f), [&]() { AdvanceSelectedLanTarget(1); });
+            ImGui::NextColumn();
+            draw_action_button("UDP 开关", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() {
+                bool enabled = false;
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.udp_enabled = !network_state_.udp_enabled;
+                    enabled = network_state_.udp_enabled;
+                }
+                last_ui_event_ = Fmt("UDP 推流已%s", enabled ? "开启" : "关闭");
+            });
+            ImGui::NextColumn();
+            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() {
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.send_snapshot_requested = true;
+                }
+                last_ui_event_ = Fmt("已排队发送一帧到 %s", selected_target.c_str());
+            });
+            ImGui::NextColumn();
+            draw_action_button("端口 +", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() {
+                uint16_t port = 0;
+                bool changed = false;
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    if (network_state_.udp_port < 65535) {
+                        ++network_state_.udp_port;
+                        port = network_state_.udp_port;
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    last_ui_event_ = Fmt("UDP 端口已设置为 %u", static_cast<unsigned int>(port));
+                }
+            });
+            break;
+        case DashboardSection::Mapping:
+            draw_action_button("开始校准", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { BeginHandCalibration(); });
+            ImGui::NextColumn();
+            draw_action_button("清除校准", ImVec4(0.84f, 0.88f, 0.93f, 1.0f), [&]() { ClearHandCalibration(); });
+            ImGui::NextColumn();
+            draw_action_button("切到手部", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() { SetDashboardSection(DashboardSection::Hand); });
+            ImGui::NextColumn();
+            draw_action_button("扫描局域网", ImVec4(0.16f, 0.66f, 0.86f, 1.0f), [&]() { StartLanScan(); });
+            ImGui::NextColumn();
+            draw_action_button("UDP 开关", ImVec4(0.22f, 0.56f, 0.96f, 1.0f), [&]() {
+                bool enabled = false;
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.udp_enabled = !network_state_.udp_enabled;
+                    enabled = network_state_.udp_enabled;
+                }
+                last_ui_event_ = Fmt("UDP 推流已%s", enabled ? "开启" : "关闭");
+            });
+            ImGui::NextColumn();
+            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() {
+                {
+                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                    network_state_.send_snapshot_requested = true;
+                }
+                last_ui_event_ = Fmt("已排队发送一帧到 %s", selected_target.c_str());
+            });
+            break;
+    }
+    ImGui::Columns(1);
+    ImGui::EndChild();
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(3);
 }
 
 void ControllerDiagnosticDemo::SetDashboardSection(DashboardSection section) {
     dashboard_section_ = section;
-    RefreshDashboardNavigation();
-    RefreshDashboardActionButtons();
 
     switch (section) {
         case DashboardSection::Overview:
@@ -828,129 +1046,6 @@ void ControllerDiagnosticDemo::SetDashboardSection(DashboardSection section) {
             break;
         case DashboardSection::Mapping:
             last_ui_event_ = "已切换到映射页";
-            break;
-    }
-}
-
-void ControllerDiagnosticDemo::ConfigureDashboardActionButton(int slot, const char* label, std::function<void()> callback,
-                                                             float r, float g, float b, float a, bool dark_text) {
-    if (dashboard_window_ == nullptr || slot < 0 || slot >= static_cast<int>(action_button_ids_.size())) {
-        return;
-    }
-
-    const int component_id = action_button_ids_[slot];
-    if (component_id < 0) {
-        return;
-    }
-
-    dashboard_window_->UpdateText(component_id, label);
-    dashboard_window_->SetButtonCallback(component_id, std::move(callback));
-    dashboard_window_->SetComponentBgColor(component_id, r, g, b, a);
-    dashboard_window_->SetComponentTextColor(component_id, dark_text ? 0.18f : 1.0f, dark_text ? 0.22f : 1.0f,
-                                             dark_text ? 0.28f : 1.0f, 1.0f);
-}
-
-void ControllerDiagnosticDemo::RefreshDashboardActionButtons() {
-    switch (dashboard_section_) {
-        case DashboardSection::Overview:
-            ConfigureDashboardActionButton(0, "面板居中", [&]() { ResetPanelPose(); }, 0.22f, 0.56f, 0.96f, 1.0f, false);
-            ConfigureDashboardActionButton(1, "扫描局域网", [&]() { StartLanScan(); }, 0.16f, 0.66f, 0.86f, 1.0f, false);
-            ConfigureDashboardActionButton(2, "左手震动", [&]() { PulseController(Side::LEFT); }, 0.72f, 0.80f, 0.96f, 1.0f, true);
-            ConfigureDashboardActionButton(3, "右手震动", [&]() { PulseController(Side::RIGHT); }, 0.72f, 0.80f, 0.96f, 1.0f, true);
-            ConfigureDashboardActionButton(4, "开始校准", [&]() { BeginHandCalibration(); }, 0.18f, 0.72f, 0.52f, 1.0f, false);
-            ConfigureDashboardActionButton(5, "发送一帧", [&]() {
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.send_snapshot_requested = true;
-                }
-                last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
-            }, 0.96f, 0.68f, 0.20f, 1.0f, true);
-            break;
-        case DashboardSection::Controller:
-            ConfigureDashboardActionButton(0, "左手震动", [&]() { PulseController(Side::LEFT); }, 0.22f, 0.56f, 0.96f, 1.0f, false);
-            ConfigureDashboardActionButton(1, "右手震动", [&]() { PulseController(Side::RIGHT); }, 0.16f, 0.66f, 0.86f, 1.0f, false);
-            ConfigureDashboardActionButton(2, "面板居中", [&]() { ResetPanelPose(); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
-            ConfigureDashboardActionButton(3, "开始校准", [&]() { BeginHandCalibration(); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
-            ConfigureDashboardActionButton(4, "切到网络", [&]() { SetDashboardSection(DashboardSection::Network); }, 0.18f, 0.72f, 0.52f, 1.0f, false);
-            ConfigureDashboardActionButton(5, "发送一帧", [&]() {
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.send_snapshot_requested = true;
-                }
-                last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
-            }, 0.96f, 0.68f, 0.20f, 1.0f, true);
-            break;
-        case DashboardSection::Hand:
-            ConfigureDashboardActionButton(0, "开始校准", [&]() { BeginHandCalibration(); }, 0.22f, 0.56f, 0.96f, 1.0f, false);
-            ConfigureDashboardActionButton(1, "清除校准", [&]() { ClearHandCalibration(); }, 0.16f, 0.66f, 0.86f, 1.0f, false);
-            ConfigureDashboardActionButton(2, "面板居中", [&]() { ResetPanelPose(); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
-            ConfigureDashboardActionButton(3, "切到映射", [&]() { SetDashboardSection(DashboardSection::Mapping); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
-            ConfigureDashboardActionButton(4, "扫描局域网", [&]() { StartLanScan(); }, 0.18f, 0.72f, 0.52f, 1.0f, false);
-            ConfigureDashboardActionButton(5, "发送一帧", [&]() {
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.send_snapshot_requested = true;
-                }
-                last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
-            }, 0.96f, 0.68f, 0.20f, 1.0f, true);
-            break;
-        case DashboardSection::Network:
-            ConfigureDashboardActionButton(0, "扫描局域网", [&]() { StartLanScan(); }, 0.22f, 0.56f, 0.96f, 1.0f, false);
-            ConfigureDashboardActionButton(1, "上个目标", [&]() { AdvanceSelectedLanTarget(-1); }, 0.16f, 0.66f, 0.86f, 1.0f, false);
-            ConfigureDashboardActionButton(2, "下个目标", [&]() { AdvanceSelectedLanTarget(1); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
-            ConfigureDashboardActionButton(3, "UDP 开关", [&]() {
-                bool udp_enabled = false;
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.udp_enabled = !network_state_.udp_enabled;
-                    udp_enabled = network_state_.udp_enabled;
-                }
-                last_ui_event_ = Fmt("UDP 推流已%s", udp_enabled ? "开启" : "关闭");
-            }, 0.82f, 0.87f, 0.94f, 1.0f, true);
-            ConfigureDashboardActionButton(4, "端口 +", [&]() {
-                uint16_t port = 0;
-                bool changed = false;
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    if (network_state_.udp_port < 65535) {
-                        ++network_state_.udp_port;
-                        port = network_state_.udp_port;
-                        changed = true;
-                    }
-                }
-                if (changed) {
-                    last_ui_event_ = Fmt("UDP 端口已设置为 %u", static_cast<unsigned int>(port));
-                }
-            }, 0.18f, 0.72f, 0.52f, 1.0f, false);
-            ConfigureDashboardActionButton(5, "发送一帧", [&]() {
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.send_snapshot_requested = true;
-                }
-                last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
-            }, 0.96f, 0.68f, 0.20f, 1.0f, true);
-            break;
-        case DashboardSection::Mapping:
-            ConfigureDashboardActionButton(0, "开始校准", [&]() { BeginHandCalibration(); }, 0.22f, 0.56f, 0.96f, 1.0f, false);
-            ConfigureDashboardActionButton(1, "清除校准", [&]() { ClearHandCalibration(); }, 0.16f, 0.66f, 0.86f, 1.0f, false);
-            ConfigureDashboardActionButton(2, "切到手部", [&]() { SetDashboardSection(DashboardSection::Hand); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
-            ConfigureDashboardActionButton(3, "扫描局域网", [&]() { StartLanScan(); }, 0.82f, 0.87f, 0.94f, 1.0f, true);
-            ConfigureDashboardActionButton(4, "UDP 开关", [&]() {
-                bool udp_enabled = false;
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.udp_enabled = !network_state_.udp_enabled;
-                    udp_enabled = network_state_.udp_enabled;
-                }
-                last_ui_event_ = Fmt("UDP 推流已%s", udp_enabled ? "开启" : "关闭");
-            }, 0.18f, 0.72f, 0.52f, 1.0f, false);
-            ConfigureDashboardActionButton(5, "发送一帧", [&]() {
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.send_snapshot_requested = true;
-                }
-                last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
-            }, 0.96f, 0.68f, 0.20f, 1.0f, true);
             break;
     }
 }
@@ -1932,21 +2027,6 @@ void ControllerDiagnosticDemo::UpdateHandVisuals() {
 }
 
 void ControllerDiagnosticDemo::UpdateRuntimeState() {
-    if (dashboard_window_ != nullptr) {
-        const int active_controllers =
-                static_cast<int>(current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE) +
-                static_cast<int>(current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE);
-        const int active_hands = static_cast<int>(hand_states_[Side::LEFT].active) +
-                                 static_cast<int>(hand_states_[Side::RIGHT].active);
-        dashboard_window_->UpdateText(
-                hero_summary_text_id_,
-                Fmt("PICO 4  |  帧 %lld  |  手柄 %d  |  手部 %d  |  手部追踪 %s",
-                    static_cast<long long>(current_frame_in_.frame_number), active_controllers, active_hands,
-                    hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str())
-                        .c_str());
-        dashboard_window_->UpdateText(event_text_id_, Fmt("最近事件：%s", last_ui_event_.c_str()).c_str());
-    }
-
     if (controller_window_ != nullptr) {
         controller_window_->UpdateText(left_controller_text_id_, BuildControllerText(Side::LEFT).c_str());
         controller_window_->UpdateText(right_controller_text_id_, BuildControllerText(Side::RIGHT).c_str());
@@ -1983,236 +2063,6 @@ void ControllerDiagnosticDemo::UpdateRuntimeState() {
 
     if (network_window_ != nullptr) {
         network_window_->UpdateText(network_status_text_id_, BuildNetworkPanelText().c_str());
-    }
-
-    if (dashboard_window_ != nullptr) {
-        const int active_controllers =
-                static_cast<int>(current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE) +
-                static_cast<int>(current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE);
-        const int active_hands = static_cast<int>(hand_states_[Side::LEFT].active) +
-                                 static_cast<int>(hand_states_[Side::RIGHT].active);
-
-        std::string runtime_title = "运行总览";
-        std::string controller_title = "手柄状态";
-        std::string mapping_title = "灵巧手映射";
-        std::string network_title = "网络工具";
-        std::string hand_title = "手部追踪";
-        std::string runtime_body = Fmt("预测显示时间  %.3f 秒\n"
-                                       "在线手柄  %d\n"
-                                       "在线手部  %d\n"
-                                       "手部扩展  %s\n"
-                                       "瞄准扩展  %s\n"
-                                       "数据源扩展  %s\n"
-                                       "追踪器状态  %s",
-                                       SecondsFromXrTime(current_frame_in_.predicted_display_time),
-                                       active_controllers, active_hands,
-                                       hand_tracking_supported_ ? "已启用" : "缺失",
-                                       hand_tracking_aim_enabled_ ? "已启用" : "已关闭",
-                                       hand_tracking_source_supported_ ? "已启用" : "缺失",
-                                       hand_tracking_create_error_.c_str());
-        std::string controller_body =
-                Fmt("%s\n\n%s", BuildControllerText(Side::LEFT).c_str(), BuildControllerText(Side::RIGHT).c_str());
-        std::string hand_body = Fmt("%s\n\n%s", BuildHandText(Side::LEFT).c_str(), BuildHandText(Side::RIGHT).c_str());
-        std::string mapping_left_body = BuildRobotMappingText(Side::LEFT);
-        std::string mapping_right_body = BuildRobotMappingText(Side::RIGHT);
-        std::string network_body = BuildNetworkPanelText();
-        std::string footer_hint = "建议流程：先确认输入状态，再扫描局域网、切换目标，最后开启 UDP 推流。";
-        const std::string calibration_status = BuildCalibrationStatusText();
-
-        switch (dashboard_section_) {
-            case DashboardSection::Overview:
-                runtime_body = Fmt("预测显示  %.3f 秒\n"
-                                   "在线手柄  %d / 2\n"
-                                   "在线手部  %d / 2\n"
-                                   "手追扩展  %s\n"
-                                   "追踪器  %s",
-                                   SecondsFromXrTime(current_frame_in_.predicted_display_time),
-                                   active_controllers, active_hands,
-                                   hand_tracking_supported_ ? "已启用" : "缺失",
-                                   hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str());
-                controller_body = Fmt("左手柄\n状态  %s\n扳机 %.2f  握把 %.2f\n电量 %.1f / 5\n\n"
-                                      "右手柄\n状态  %s\n扳机 %.2f  握把 %.2f\n电量 %.1f / 5",
-                                      current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE ? "在线" : "离线",
-                                      current_frame_in_.controller_trigger_value[Side::LEFT],
-                                      current_frame_in_.controller_grip_value[Side::LEFT],
-                                      current_frame_in_.controller_battery_value[Side::LEFT],
-                                      current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE ? "在线" : "离线",
-                                      current_frame_in_.controller_trigger_value[Side::RIGHT],
-                                      current_frame_in_.controller_grip_value[Side::RIGHT],
-                                      current_frame_in_.controller_battery_value[Side::RIGHT]);
-                hand_body = Fmt("左手\n状态  %s\n捏合 %.0f%%\n\n"
-                                "右手\n状态  %s\n捏合 %.0f%%",
-                                hand_states_[Side::LEFT].active ? "在线" : "离线",
-                                hand_states_[Side::LEFT].pinch_index * 100.0f,
-                                hand_states_[Side::RIGHT].active ? "在线" : "离线",
-                                hand_states_[Side::RIGHT].pinch_index * 100.0f);
-                mapping_left_body = Fmt("左手映射\n拇指 X %s\n拇指 Y %s\n食指 %s\n中指 %s",
-                                        hand_calibration_states_[Side::LEFT].calibrated ? "已校准" : "未校准",
-                                        hand_calibration_states_[Side::LEFT].calibrated ? "已校准" : "未校准",
-                                        hand_states_[Side::LEFT].active ? "在线" : "等待",
-                                        hand_states_[Side::LEFT].active ? "在线" : "等待");
-                mapping_right_body = Fmt("右手映射\n拇指 X %s\n拇指 Y %s\n食指 %s\n中指 %s",
-                                         hand_calibration_states_[Side::RIGHT].calibrated ? "已校准" : "未校准",
-                                         hand_calibration_states_[Side::RIGHT].calibrated ? "已校准" : "未校准",
-                                         hand_states_[Side::RIGHT].active ? "在线" : "等待",
-                                         hand_states_[Side::RIGHT].active ? "在线" : "等待");
-                network_body = Fmt("UDP  %s\n本机  %s\n目标  %s\n端口  %u\n设备  %d 台",
-                                   network_state_.udp_enabled ? "开启" : "关闭",
-                                   network_state_.interface_info.valid ? network_state_.interface_info.local_ip.c_str() : "未找到",
-                                   BuildSelectedTargetLabel().c_str(),
-                                   static_cast<unsigned int>(network_state_.udp_port),
-                                   static_cast<int>(network_state_.discovered_devices.size()));
-                footer_hint = Fmt("最近事件：%s", last_ui_event_.c_str());
-                break;
-            case DashboardSection::Controller:
-                runtime_title = "输入总览";
-                controller_title = "左手柄";
-                hand_title = "右手柄";
-                mapping_title = "按键与触摸";
-                network_title = "操作提示";
-                runtime_body = Fmt("当前帧  %lld\n在线手柄  %d / 2\n最近事件  %s\n"
-                                   "左摇杆  %.2f, %.2f\n右摇杆  %.2f, %.2f",
-                                   static_cast<long long>(current_frame_in_.frame_number), active_controllers,
-                                   last_ui_event_.c_str(), current_frame_in_.left_joystick_position.x,
-                                   current_frame_in_.left_joystick_position.y,
-                                   current_frame_in_.right_joystick_position.x,
-                                   current_frame_in_.right_joystick_position.y);
-                controller_body = BuildControllerText(Side::LEFT);
-                hand_body = BuildControllerText(Side::RIGHT);
-                mapping_left_body =
-                        Fmt("左手输入\n%s\n\n右手输入\n%s",
-                            BuildButtonSummary(Side::LEFT).c_str(), BuildButtonSummary(Side::RIGHT).c_str());
-                mapping_right_body = Fmt("常用动作\n左手震动  触发左控制器震动\n右手震动  触发右控制器震动\n"
-                                         "开始校准  手势上线后等待 2 秒取零点\n最近事件  %s",
-                                         last_ui_event_.c_str());
-                network_body = Fmt("当前 UDP 目标  %s\n端口  %u\n推流  %s\n"
-                                   "%s",
-                                   BuildSelectedTargetLabel().c_str(),
-                                   static_cast<unsigned int>(network_state_.udp_port),
-                                   network_state_.udp_enabled ? "开启" : "关闭",
-                                   calibration_status.c_str());
-                footer_hint = "手柄页会把左右控制器拆开显示，便于看按键、摇杆、扳机和震动联调。";
-                break;
-            case DashboardSection::Hand:
-                runtime_title = "追踪状态";
-                controller_title = "左手骨架";
-                hand_title = "右手骨架";
-                mapping_title = "手势摘要";
-                network_title = "校准状态";
-                runtime_body = Fmt("手部扩展  %s\n瞄准扩展  %s\n数据源扩展  %s\n"
-                                   "在线手部  %d / 2\n追踪器状态  %s",
-                                   hand_tracking_supported_ ? "已启用" : "缺失",
-                                   hand_tracking_aim_enabled_ ? "已启用" : "已关闭",
-                                   hand_tracking_source_supported_ ? "已启用" : "缺失",
-                                   active_hands, hand_tracking_create_error_.c_str());
-                controller_body = BuildHandText(Side::LEFT);
-                hand_body = BuildHandText(Side::RIGHT);
-                mapping_left_body =
-                        Fmt("左手手势\n%s\n\n右手手势\n%s",
-                            BuildHandGestureSummary(Side::LEFT).c_str(),
-                            BuildHandGestureSummary(Side::RIGHT).c_str());
-                mapping_right_body = Fmt("说明\n拿起手柄后，运行时可能暂停相机驱动的手部骨架。\n"
-                                         "如果这里离线，但手柄在线，通常属于运行时策略，不一定是程序异常。");
-                network_body = Fmt("%s\n\n点击“开始校准”后，程序会等待手势上线，再延迟 2 秒记录零点。",
-                                   calibration_status.c_str());
-                footer_hint = "手部页用于确认骨架、捏合、数据源和校准状态，优先判断是不是运行时暂停了手追。";
-                break;
-            case DashboardSection::Network:
-                runtime_title = "网络状态";
-                controller_title = "目标选择";
-                hand_title = "推流控制";
-                mapping_title = "发送内容";
-                network_title = "全部设备";
-                runtime_body = Fmt("连接  %s\n发送  %s\n接口  %s\n本机  %s\n广播  %s",
-                                   network_state_.interface_info.valid ? "已连接局域网" : "未连接局域网",
-                                   (IsTriggerStreamingActive(Side::LEFT) || IsTriggerStreamingActive(Side::RIGHT))
-                                           ? "扳机发送中"
-                                           : (network_state_.udp_enabled ? "持续发送中" : "空闲"),
-                                   network_state_.interface_info.interface_name.empty()
-                                           ? "未找到"
-                                           : network_state_.interface_info.interface_name.c_str(),
-                                   network_state_.interface_info.local_ip.empty()
-                                           ? "无"
-                                           : network_state_.interface_info.local_ip.c_str(),
-                                   network_state_.interface_info.broadcast_ip.empty()
-                                           ? "无"
-                                           : network_state_.interface_info.broadcast_ip.c_str());
-                controller_body = Fmt("当前目标  %s\n端口  %u\n扫描状态  %s\n已发现设备  %d 台",
-                                      BuildSelectedTargetLabel().c_str(),
-                                      static_cast<unsigned int>(network_state_.udp_port),
-                                      network_state_.scan_status.c_str(),
-                                      static_cast<int>(network_state_.discovered_devices.size()));
-                hand_body = Fmt("UDP 推流  %s\n发送一帧  %s\n最近事件  %s\n"
-                                "可用底部按钮：扫描局域网 / 上个目标 / 下个目标 / UDP 开关 / 发送一帧",
-                                network_state_.udp_enabled ? "开启" : "关闭",
-                                network_state_.send_snapshot_requested ? "已排队" : "空闲",
-                                last_ui_event_.c_str());
-                mapping_left_body = Fmt("发送字段概览\nframe=%lld\ncontroller_left=%s\ncontroller_right=%s\n"
-                                        "hand_left=%s\nhand_right=%s",
-                                        static_cast<long long>(current_frame_in_.frame_number),
-                                        current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE ? "online" : "offline",
-                                        current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE ? "online" : "offline",
-                                        hand_states_[Side::LEFT].active ? "online" : "offline",
-                                        hand_states_[Side::RIGHT].active ? "online" : "offline");
-                {
-                    std::ostringstream devices_stream;
-                    if (network_state_.discovered_devices.empty()) {
-                        devices_stream << "暂无设备";
-                    } else {
-                        for (size_t index = 0; index < network_state_.discovered_devices.size(); ++index) {
-                            const bool selected = static_cast<int>(index + 1) == network_state_.selected_target_index;
-                            devices_stream << (selected ? "> " : "  ")
-                                           << (index + 1) << ". "
-                                           << network_state_.discovered_devices[index].ip
-                                           << "  "
-                                           << network_state_.discovered_devices[index].mac
-                                           << "\n";
-                        }
-                    }
-                    network_body = devices_stream.str();
-                }
-                mapping_right_body = Fmt("联调步骤\n1. 扫描局域网\n2. 切换目标\n3. 发送一帧\n4. 再开持续 UDP\n"
-                                         "当前高亮目标会显示为 > 序号");
-                footer_hint = "网络页专门用于局域网扫描和 UDP 推流联调，先验证单帧，再开持续发送。";
-                break;
-            case DashboardSection::Mapping:
-                runtime_title = "映射总览";
-                controller_title = "左手映射";
-                hand_title = "右手映射";
-                mapping_title = "映射解释";
-                network_title = "输出联调";
-                runtime_body = Fmt("在线手部  %d / 2\n追踪器状态  %s\n数据源扩展  %s\n"
-                                   "这一页重点查看灵巧手重定向所需角度。\n%s",
-                                   active_hands, hand_tracking_create_error_.c_str(),
-                                   hand_tracking_source_supported_ ? "已启用" : "缺失",
-                                   calibration_status.c_str());
-                controller_body = BuildRobotMappingText(Side::LEFT);
-                hand_body = BuildRobotMappingText(Side::RIGHT);
-                mapping_left_body = "当前映射关注项\n拇指 X侧摆\n拇指 Y弯曲\n食指弯曲\n中指弯曲\n无名指弯曲\n小指弯曲";
-                mapping_right_body =
-                        Fmt("手势参考\n左手  %s\n右手  %s\n\n校准后会以当前手势作为 0 点。",
-                            BuildHandGestureSummary(Side::LEFT).c_str(),
-                            BuildHandGestureSummary(Side::RIGHT).c_str());
-                network_body = Fmt("UDP 目标  %s\n推流  %s\n"
-                                   "如果映射角度正常，就可以切到网络页把 JSON 发给局域网对端。",
-                                   BuildSelectedTargetLabel().c_str(),
-                                   network_state_.udp_enabled ? "开启" : "关闭");
-                footer_hint = "映射页把左右手角度拆开看，更适合对接灵巧手或机械手的关节重定向。";
-                break;
-        }
-
-        dashboard_window_->UpdateText(runtime_title_text_id_, runtime_title.c_str());
-        dashboard_window_->UpdateText(controller_title_text_id_, controller_title.c_str());
-        dashboard_window_->UpdateText(mapping_title_text_id_, mapping_title.c_str());
-        dashboard_window_->UpdateText(network_title_text_id_, network_title.c_str());
-        dashboard_window_->UpdateText(hand_title_text_id_, hand_title.c_str());
-        dashboard_window_->UpdateText(runtime_text_id_, runtime_body.c_str());
-        dashboard_window_->UpdateText(left_controller_text_id_, controller_body.c_str());
-        dashboard_window_->UpdateText(right_controller_text_id_, hand_body.c_str());
-        dashboard_window_->UpdateText(left_robot_mapping_text_id_, mapping_left_body.c_str());
-        dashboard_window_->UpdateText(right_robot_mapping_text_id_, mapping_right_body.c_str());
-        dashboard_window_->UpdateText(network_status_text_id_, network_body.c_str());
-        dashboard_window_->UpdateText(footer_hint_text_id_, footer_hint.c_str());
     }
 }
 

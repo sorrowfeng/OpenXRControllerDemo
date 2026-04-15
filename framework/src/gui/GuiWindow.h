@@ -91,6 +91,8 @@ namespace PVRSampleFW {
         std::function<void(bool)> checkBoxCallback;
     };
 
+    using GuiWindowCustomRenderCallback = std::function<void()>;
+
     class GuiWindow {
     public:
         class Builder {
@@ -198,6 +200,10 @@ namespace PVRSampleFW {
         ~GuiWindow();
 
         void UpdatePrimaryText(const char* text);
+        void SetCustomRenderCallback(GuiWindowCustomRenderCallback callback);
+        const GuiWindowCustomRenderCallback& GetCustomRenderCallback() const {
+            return custom_render_callback_;
+        }
 
         /**
          * Add a button
@@ -366,6 +372,7 @@ namespace PVRSampleFW {
         RayInputEvent ray_input_;
         bool need_render_{true};
         uint32_t rendered_tex_id_{0};
+        GuiWindowCustomRenderCallback custom_render_callback_{};
     };
 
 }  // namespace PVRSampleFW
