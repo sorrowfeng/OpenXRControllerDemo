@@ -16,6 +16,8 @@
 #include "xr_linear.h"
 
 #include <android_native_app_glue.h>
+#include <android/log.h>
+#include <arpa/inet.h>
 
 #include <algorithm>
 #include <array>
@@ -343,6 +345,7 @@ private:
         bool ring_bend_valid{false};
         bool little_bend_valid{false};
         XrVector3f palm_position{0.0f, 0.0f, 0.0f};
+        XrQuaternionf palm_orientation{0.0f, 0.0f, 0.0f, 1.0f};
         XrVector3f index_tip_position{0.0f, 0.0f, 0.0f};
         float thumb_x{0.0f};
         float thumb_y{0.0f};
@@ -377,11 +380,13 @@ private:
         std::string broadcast_ip;
     };
 
+    enum class UdpDataSource { HAND, CONTROLLER };
+
     struct NetworkStreamingState {
         bool udp_enabled{false};
         bool scan_in_progress{false};
         bool send_snapshot_requested{false};
-        uint16_t udp_port{5005};
+        uint16_t udp_port{9999};
         int selected_target_index{0};
         int socket_fd{-1};
         uint64_t packet_sequence{0};
@@ -441,7 +446,6 @@ private:
     std::string BuildCalibrationStatusText() const;
     void UpdateDashboardDragging();
     void CalibrateControllerFallbackZero(int hand);
-    bool IsTriggerStreamingActive(int hand) const;
     float ComputeThumbPinchStrength(const HandTrackingState& hand_state, XrHandJointEXT finger_tip_joint) const;
 
 private:
@@ -511,6 +515,12 @@ private:
     std::array<HandCalibrationState, Side::COUNT> hand_calibration_states_{};
     NetworkStreamingState network_state_{};
     DashboardSection dashboard_section_{DashboardSection::Overview};
+
+    std::chrono::steady_clock::time_point x_press_time_{};
+    std::chrono::steady_clock::time_point a_press_time_{};
+    bool x_long_triggered_{false};
+    bool a_long_triggered_{false};
+    UdpDataSource udp_data_source_{UdpDataSource::CONTROLLER};
 };
 
 ControllerDiagnosticDemo::ControllerDiagnosticDemo(const std::shared_ptr<Configurations>& appConfig)
@@ -573,7 +583,7 @@ bool ControllerDiagnosticDemo::CustomizedPreRenderFrame() {
     UpdateHandTracking();
     UpdateHandVisuals();
     UpdateHandCalibration();
-    UpdateDashboardDragging();
+    // UpdateDashboardDragging();  // 已禁用应用层拖动，由系统层处理窗口移动
     DetectInputEvents();
     UpdateRuntimeState();
     UpdateNetworkStreaming();
@@ -662,8 +672,6 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
         scan_status = network_state_.scan_status;
     }
 
-    const bool trigger_streaming =
-            IsTriggerStreamingActive(Side::LEFT) || IsTriggerStreamingActive(Side::RIGHT);
     const int active_controllers =
             static_cast<int>(current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE) +
             static_cast<int>(current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE);
@@ -754,8 +762,11 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     draw_nav_button(DashboardSection::Network);
     draw_nav_button(DashboardSection::Mapping);
     ImGui::Spacing();
-    draw_status_badge("拖动窗口", dashboard_drag_active_ ? "抓握移动中" : "按住握把再移动", ImVec4(0.92f, 0.94f, 0.98f, 1.0f), -1.0f);
-    ImGui::TextWrapped("抓握键按住后移动控制器，可以拖动整块窗口。");
+    draw_status_badge("拖动窗口", "扳机键拖动", ImVec4(0.92f, 0.94f, 0.98f, 1.0f), -1.0f);
+    ImGui::TextWrapped("按住扳机键并移动控制器，可拖动窗口位置。");
+    ImGui::Spacing();
+    draw_status_badge("快捷按键", "X / A", ImVec4(0.96f, 0.96f, 0.97f, 1.0f), -1.0f);
+    ImGui::TextWrapped("短按 X/A 键：切换 UDP 发送开关。长按 X 键：左手重置零点。长按 A 键：右手重置零点。");
     ImGui::EndChild();
 
     ImGui::SameLine();
@@ -765,16 +776,22 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     ImGui::TextColored(ImVec4(0.38f, 0.44f, 0.52f, 1.0f), "当前页面：%s", section_label(dashboard_section_));
     ImGui::Separator();
 
-    ImGui::Columns(4, "top_badges", false);
+    ImGui::Columns(5, "top_badges", false);
     draw_status_badge("最近事件", last_ui_event_.c_str(), ImVec4(0.82f, 0.91f, 1.0f, 1.0f), -1.0f);
     ImGui::NextColumn();
     draw_status_badge("手追状态", hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str(),
                       hand_tracking_ready_ ? ImVec4(0.72f, 0.92f, 0.80f, 1.0f) : ImVec4(1.0f, 0.84f, 0.72f, 1.0f), -1.0f);
     ImGui::NextColumn();
-    draw_status_badge("发送状态", trigger_streaming ? "扳机发送中" : (udp_enabled ? "持续发送中" : "空闲"),
-                      trigger_streaming ? ImVec4(0.62f, 0.92f, 0.72f, 1.0f)
-                                        : (udp_enabled ? ImVec4(0.72f, 0.88f, 1.0f, 1.0f)
-                                                       : ImVec4(0.90f, 0.90f, 0.92f, 1.0f)),
+    draw_status_badge("发送状态", udp_enabled ? "持续发送中" : "空闲",
+                      udp_enabled ? ImVec4(0.72f, 0.88f, 1.0f, 1.0f)
+                                  : ImVec4(0.90f, 0.90f, 0.92f, 1.0f),
+                      -1.0f);
+    ImGui::NextColumn();
+    draw_status_badge("数据源",
+                      udp_data_source_ == UdpDataSource::HAND ? "手势数据" : "手柄数据",
+                      udp_data_source_ == UdpDataSource::HAND
+                              ? ImVec4(0.72f, 0.92f, 0.80f, 1.0f)
+                              : ImVec4(0.88f, 0.80f, 0.96f, 1.0f),
                       -1.0f);
     ImGui::NextColumn();
     draw_status_badge("连接状态", interface_info.valid ? "局域网已连接" : "局域网未连接",
@@ -813,7 +830,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                               interface_info.local_ip.empty() ? "无" : interface_info.local_ip.c_str(),
                               selected_target.c_str(), static_cast<unsigned int>(udp_port),
                               static_cast<int>(devices.size()),
-                              trigger_streaming ? "扳机发送中" : (udp_enabled ? "持续发送中" : "空闲")));
+                              udp_enabled ? "持续发送中" : "空闲"));
         });
         ImGui::Columns(1);
         ImGui::EndChild();
@@ -864,45 +881,72 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     } else {
         ImGui::BeginChild("network_grid", ImVec2(0, -170.0f), false);
         ImGui::Columns(2, "network_cols", false);
-        draw_card("连接状态", ImVec2(0, 430.0f), [&]() {
-            draw_big_text(Fmt("连接  %s\n发送  %s\n接口  %s\n本机  %s\n广播  %s\n扫描  %s\n已发包  %llu",
-                              interface_info.valid ? "已连接局域网" : "未连接局域网",
-                              trigger_streaming ? "扳机发送中" : (udp_enabled ? "持续发送中" : "空闲"),
-                              interface_info.interface_name.empty() ? "未找到" : interface_info.interface_name.c_str(),
-                              interface_info.local_ip.empty() ? "无" : interface_info.local_ip.c_str(),
-                              interface_info.broadcast_ip.empty() ? "无" : interface_info.broadcast_ip.c_str(),
-                              scan_in_progress ? "扫描中" : scan_status.c_str(),
-                              static_cast<unsigned long long>(packet_sequence)));
-        });
-        ImGui::NextColumn();
-        draw_card("全部设备", ImVec2(0, 430.0f), [&]() {
-            ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 1.0f), "当前目标：%s", selected_target.c_str());
+
+        // 左侧：关键状态高亮显示
+        draw_card("网络状态", ImVec2(0, 0), [&]() {
+            // 目标地址
+            ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "目标地址");
+            ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%s", selected_target.c_str());
             ImGui::Separator();
+
+            // 端口
+            ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "UDP 端口");
+            ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%u", static_cast<unsigned int>(udp_port));
+            ImGui::Separator();
+
+            // 发送状态（大且醒目）
+            ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "发送状态");
+            if (udp_enabled) {
+                ImGui::TextColored(ImVec4(0.12f, 0.68f, 0.38f, 1.0f), "持续发送中");
+            } else {
+                ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.62f, 1.0f), "已停止");
+            }
+            ImGui::Separator();
+
+            // 数据源
+            ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "数据源");
+            ImGui::TextColored(udp_data_source_ == UdpDataSource::HAND
+                                       ? ImVec4(0.12f, 0.68f, 0.38f, 1.0f)
+                                       : ImVec4(0.68f, 0.40f, 0.84f, 1.0f),
+                               "%s", udp_data_source_ == UdpDataSource::HAND ? "手势数据" : "手柄数据");
+            ImGui::Separator();
+
+            // 已发包
+            ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "已发包数");
+            ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%llu",
+                               static_cast<unsigned long long>(packet_sequence));
+            ImGui::Separator();
+
+            // 本机与接口
+            ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 1.0f), "本机 %s", interface_info.local_ip.empty() ? "-" : interface_info.local_ip.c_str());
+            ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 1.0f), "接口 %s", interface_info.interface_name.empty() ? "-" : interface_info.interface_name.c_str());
+
+            // 扫描/发送状态提示
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.62f, 1.0f), "%s",
+                               scan_in_progress ? "扫描中..." : scan_status.c_str());
+        });
+
+        ImGui::NextColumn();
+        draw_card("设备列表", ImVec2(0, 0), [&]() {
             ImGui::BeginChild("device_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
             if (devices.empty()) {
                 ImGui::TextWrapped("暂无可用 IP，请先扫描局域网。");
             } else {
                 for (size_t index = 0; index < devices.size(); ++index) {
                     const bool selected = static_cast<int>(index + 1) == selected_target_index;
-                    ImGui::TextColored(selected ? ImVec4(0.10f, 0.45f, 0.82f, 1.0f) : ImVec4(0.18f, 0.22f, 0.28f, 1.0f),
-                                       "%s%zu. %s  %s",
-                                       selected ? "> " : "  ", index + 1,
-                                       devices[index].ip.c_str(), devices[index].mac.c_str());
+                    if (selected) {
+                        ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "> %zu. %s  %s",
+                                           index + 1, devices[index].ip.c_str(), devices[index].mac.c_str());
+                    } else {
+                        ImGui::TextColored(ImVec4(0.18f, 0.22f, 0.28f, 1.0f), "  %zu. %s  %s",
+                                           index + 1, devices[index].ip.c_str(), devices[index].mac.c_str());
+                    }
                 }
             }
             ImGui::EndChild();
         });
         ImGui::Columns(1);
-        draw_card("发送内容与步骤", ImVec2(0, 0), [&]() {
-            draw_big_text(Fmt("发送字段\nframe=%lld\nleft_controller=%s\nright_controller=%s\nleft_hand=%s\nright_hand=%s\n"
-                              "send_snapshot=%s\n\n步骤\n1. 扫描局域网\n2. 切目标\n3. 发送一帧\n4. 再开持续 UDP",
-                              static_cast<long long>(current_frame_in_.frame_number),
-                              current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE ? "online" : "offline",
-                              current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE ? "online" : "offline",
-                              hand_states_[Side::LEFT].active ? "online" : "offline",
-                              hand_states_[Side::RIGHT].active ? "online" : "offline",
-                              send_snapshot_requested ? "yes" : "no"));
-        });
         ImGui::EndChild();
     }
 
@@ -923,6 +967,15 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                 }
                 last_ui_event_ = Fmt("已排队发送一帧到 %s", selected_target.c_str());
             });
+            ImGui::NextColumn();
+            draw_action_button(udp_data_source_ == UdpDataSource::HAND ? "切手柄源" : "切手势源",
+                               ImVec4(0.88f, 0.80f, 0.96f, 1.0f), [&]() {
+                                   udp_data_source_ = (udp_data_source_ == UdpDataSource::HAND)
+                                                            ? UdpDataSource::CONTROLLER
+                                                            : UdpDataSource::HAND;
+                                   last_ui_event_ = Fmt("UDP 数据源已切换为 %s",
+                                                        udp_data_source_ == UdpDataSource::HAND ? "手势数据" : "手柄数据");
+                               });
             break;
         case DashboardSection::Controller:
             draw_controller_actions();
@@ -977,21 +1030,14 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                 last_ui_event_ = Fmt("已排队发送一帧到 %s", selected_target.c_str());
             });
             ImGui::NextColumn();
-            draw_action_button("端口 +", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() {
-                uint16_t port = 0;
-                bool changed = false;
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    if (network_state_.udp_port < 65535) {
-                        ++network_state_.udp_port;
-                        port = network_state_.udp_port;
-                        changed = true;
-                    }
-                }
-                if (changed) {
-                    last_ui_event_ = Fmt("UDP 端口已设置为 %u", static_cast<unsigned int>(port));
-                }
-            });
+            draw_action_button(udp_data_source_ == UdpDataSource::HAND ? "切手柄源" : "切手势源",
+                               ImVec4(0.88f, 0.80f, 0.96f, 1.0f), [&]() {
+                                   udp_data_source_ = (udp_data_source_ == UdpDataSource::HAND)
+                                                            ? UdpDataSource::CONTROLLER
+                                                            : UdpDataSource::HAND;
+                                   last_ui_event_ = Fmt("UDP 数据源已切换为 %s",
+                                                        udp_data_source_ == UdpDataSource::HAND ? "手势数据" : "手柄数据");
+                               });
             break;
         case DashboardSection::Mapping:
             draw_action_button("开始校准", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { BeginHandCalibration(); });
@@ -1184,18 +1230,15 @@ void ControllerDiagnosticDemo::CalibrateControllerFallbackZero(int hand) {
     calibration.zero_metrics.valid = true;
     calibration.zero_metrics.spatial_valid = true;
     calibration.zero_metrics.palm_position = current_frame_in_.controller_poses[hand].position;
-    calibration.status = "已用扳机校准零位";
-    last_ui_event_ = Fmt("%s扳机已记录当前位置为零点", hand == Side::LEFT ? "左手" : "右手");
-}
-
-bool ControllerDiagnosticDemo::IsTriggerStreamingActive(int hand) const {
-    if (hand < 0 || hand >= Side::COUNT) {
-        return false;
-    }
-
-    const uint32_t trigger_mask = hand == Side::LEFT ? kButtonTriggerLeft : kButtonTriggerRight;
-    return current_frame_in_.controller_actives[hand] == XR_TRUE && !hand_states_[hand].active &&
-           (current_frame_in_.all_buttons_bitmask & trigger_mask) != 0;
+    calibration.zero_metrics.palm_orientation = current_frame_in_.controller_poses[hand].orientation;
+    calibration.status = "已用握把校准零位";
+    last_ui_event_ = Fmt("%s握把已记录当前位置为零点", hand == Side::LEFT ? "左手" : "右手");
+    __android_log_print(ANDROID_LOG_INFO, "OpenXRControllerDemo",
+                        "CalibrateControllerFallbackZero hand=%d pos=%.3f,%.3f,%.3f",
+                        hand,
+                        calibration.zero_metrics.palm_position.x,
+                        calibration.zero_metrics.palm_position.y,
+                        calibration.zero_metrics.palm_position.z);
 }
 
 void ControllerDiagnosticDemo::UpdateDashboardDragging() {
@@ -1678,59 +1721,103 @@ bool ControllerDiagnosticDemo::ResolveSelectedTarget(sockaddr_in* out_addr) {
 }
 
 std::string ControllerDiagnosticDemo::BuildUdpPayloadJson(uint64_t sequence) const {
-    const auto build_position_json = [](bool valid, const XrVector3f& position) {
-        std::ostringstream stream;
-        stream << std::fixed << std::setprecision(4)
-               << "{\"valid\":" << JsonBool(valid) << ",\"x\":" << position.x << ",\"y\":" << position.y
-               << ",\"z\":" << position.z << "}";
-        return stream.str();
+    (void)sequence;
+    struct EulerDeg {
+        float pitch;
+        float yaw;
+        float roll;
     };
+    const auto quat_to_euler = [](const XrQuaternionf& q) -> EulerDeg {
+        const float sinr_cosp = 2.0f * (q.w * q.x + q.y * q.z);
+        const float cosr_cosp = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
+        const float roll = std::atan2(sinr_cosp, cosr_cosp);
 
-    const auto build_angle_json = [](bool valid, float angle_deg) {
-        std::ostringstream stream;
-        stream << std::fixed << std::setprecision(3)
-               << "{\"valid\":" << JsonBool(valid) << ",\"deg\":" << angle_deg << "}";
-        return stream.str();
+        const float sinp = 2.0f * (q.w * q.y - q.z * q.x);
+        float pitch = 0.0f;
+        if (std::abs(sinp) >= 1.0f) {
+            pitch = std::copysign(MATH_PI / 2.0f, sinp);
+        } else {
+            pitch = std::asin(sinp);
+        }
+
+        const float siny_cosp = 2.0f * (q.w * q.z + q.x * q.y);
+        const float cosy_cosp = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
+        const float yaw = std::atan2(siny_cosp, cosy_cosp);
+
+        constexpr float kRad2Deg = 180.0f / MATH_PI;
+        return EulerDeg{pitch * kRad2Deg, yaw * kRad2Deg, roll * kRad2Deg};
     };
 
     const auto build_hand_json = [&](int hand) {
         const RobotHandMetrics metrics = ApplyCalibration(hand, ComputeRobotHandMetrics(hand));
         const auto& hand_state = hand_states_[hand];
         const bool palm_valid = metrics.spatial_valid;
+        const EulerDeg euler = quat_to_euler(hand_state.palm_pose.orientation);
 
         std::ostringstream stream;
         stream << "{\"hand\":\"" << (hand == Side::LEFT ? "left" : "right") << "\""
-               << ",\"tracked\":" << JsonBool(hand_state.active)
-               << ",\"controller_connected\":" << JsonBool(current_frame_in_.controller_actives[hand] == XR_TRUE)
-               << ",\"calibrated\":" << JsonBool(hand_calibration_states_[hand].calibrated)
-               << ",\"sending_by_trigger\":" << JsonBool(IsTriggerStreamingActive(hand))
-               << ",\"palm_position_m\":" << build_position_json(palm_valid, metrics.palm_position)
-               << ",\"joint_angles_deg\":{"
-               << "\"thumb_x\":" << build_angle_json(metrics.thumb_x_valid, metrics.thumb_x) << ","
-               << "\"thumb_y\":" << build_angle_json(metrics.thumb_y_valid, metrics.thumb_y) << ","
-               << "\"thumb_side\":" << build_angle_json(metrics.thumb_x_valid, metrics.thumb_x) << ","
-               << "\"thumb_bend\":" << build_angle_json(metrics.thumb_y_valid, metrics.thumb_y) << ","
-               << "\"index_bend\":" << build_angle_json(metrics.index_bend_valid, metrics.index_bend) << ","
-               << "\"middle_bend\":" << build_angle_json(metrics.middle_bend_valid, metrics.middle_bend) << ","
-               << "\"ring_bend\":" << build_angle_json(metrics.ring_bend_valid, metrics.ring_bend) << ","
-               << "\"little_bend\":" << build_angle_json(metrics.little_bend_valid, metrics.little_bend) << "}"
+               << ",\"relative_position\":{\"x\":"
+               << (palm_valid ? metrics.palm_position.x : 0.0f) << ",\"y\":"
+               << (palm_valid ? metrics.palm_position.y : 0.0f) << ",\"z\":"
+               << (palm_valid ? metrics.palm_position.z : 0.0f) << "}"
+               << ",\"orientation\":{\"pitch\":" << euler.pitch << ",\"yaw\":" << euler.yaw << ",\"roll\":" << euler.roll << "}"
+               << ",\"finger_joints\":[" << std::fixed << std::setprecision(3)
+               << metrics.thumb_x << "," << metrics.thumb_y << ","
+               << metrics.index_bend << "," << metrics.middle_bend << ","
+               << metrics.ring_bend << "," << metrics.little_bend << "]"
+               << "}";
+        return stream.str();
+    };
+
+    const auto build_controller_json = [&](int hand) {
+        const bool controller_active = current_frame_in_.controller_actives[hand] == XR_TRUE;
+        const auto& pose = current_frame_in_.controller_poses[hand];
+        const float trigger = current_frame_in_.controller_trigger_value[hand];
+        const float grip = current_frame_in_.controller_grip_value[hand];
+
+        XrVector3f relative_pos = pose.position;
+        const auto& calibration = hand_calibration_states_[hand];
+        if (calibration.calibrated && calibration.zero_metrics.spatial_valid) {
+            relative_pos = SubtractVector(pose.position, calibration.zero_metrics.palm_position);
+        }
+        EulerDeg euler = quat_to_euler(pose.orientation);
+        if (calibration.calibrated && calibration.zero_metrics.spatial_valid) {
+            const EulerDeg zero_euler = quat_to_euler(calibration.zero_metrics.palm_orientation);
+            euler.pitch -= zero_euler.pitch;
+            euler.yaw   -= zero_euler.yaw;
+            euler.roll  -= zero_euler.roll;
+            auto norm = [](float a) {
+                while (a > 180.0f) a -= 360.0f;
+                while (a < -180.0f) a += 360.0f;
+                return a;
+            };
+            euler.pitch = norm(euler.pitch);
+            euler.yaw   = norm(euler.yaw);
+            euler.roll  = norm(euler.roll);
+        }
+
+        std::ostringstream stream;
+        stream << "{\"hand\":\"" << (hand == Side::LEFT ? "left" : "right") << "\""
+               << ",\"relative_position\":{\"x\":"
+               << (controller_active ? relative_pos.x : 0.0f) << ",\"y\":"
+               << (controller_active ? relative_pos.y : 0.0f) << ",\"z\":"
+               << (controller_active ? relative_pos.z : 0.0f) << "}"
+               << ",\"orientation\":{\"pitch\":" << euler.pitch << ",\"yaw\":" << euler.yaw << ",\"roll\":" << euler.roll << "}";
+        const float f0 = 1.40f;
+        const float f1_5 = controller_active ? (1.4f * trigger) : 0.0f;
+        stream << ",\"finger_joints\":[" << std::fixed << std::setprecision(3)
+               << f0 << "," << f1_5 << ","
+               << f1_5 << "," << f1_5 << ","
+               << f1_5 << "," << f1_5 << "]"
                << "}";
         return stream.str();
     };
 
     std::ostringstream stream;
-    stream << std::fixed << std::setprecision(6)
-           << "{"
-           << "\"app\":\"OpenXRControllerDemo\","
-           << "\"sequence\":" << sequence << ","
-           << "\"frame\":" << static_cast<unsigned long long>(current_frame_in_.frame_number) << ","
-           << "\"predicted_display_time_sec\":" << SecondsFromXrTime(current_frame_in_.predicted_display_time)
-           << ","
-           << "\"hands\":["
-           << build_hand_json(Side::LEFT) << ","
-           << build_hand_json(Side::RIGHT)
-           << "]"
-           << "}";
+    stream << "{\"hands\":[" << std::fixed << std::setprecision(3)
+           << (udp_data_source_ == UdpDataSource::HAND ? build_hand_json(Side::LEFT) : build_controller_json(Side::LEFT)) << ","
+           << (udp_data_source_ == UdpDataSource::HAND ? build_hand_json(Side::RIGHT) : build_controller_json(Side::RIGHT))
+           << "]}";
     return stream.str();
 }
 
@@ -1743,7 +1830,6 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
     int selected_target_index = 0;
     uint64_t packet_sequence = 0;
     std::string scan_status;
-    bool trigger_streaming = false;
     {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
         interface_info = network_state_.interface_info;
@@ -1755,7 +1841,6 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
         packet_sequence = network_state_.packet_sequence;
         scan_status = network_state_.scan_status;
     }
-    trigger_streaming = IsTriggerStreamingActive(Side::LEFT) || IsTriggerStreamingActive(Side::RIGHT);
 
     std::string selected_target =
             selected_target_index <= 0 || selected_target_index > static_cast<int>(devices.size())
@@ -1766,7 +1851,7 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
     std::ostringstream stream;
     stream << "连接状态  " << (interface_info.valid ? "已连接局域网" : "未连接局域网") << "\n";
     stream << "发送状态  "
-           << (trigger_streaming ? "扳机发送中" : (udp_enabled ? "持续发送中" : "空闲")) << "\n";
+           << (udp_enabled ? "持续发送中" : "空闲") << "\n";
     stream << "本机接口  "
            << (interface_info.valid ? Fmt("%s  %s", interface_info.interface_name.c_str(), interface_info.local_ip.c_str())
                                     : "未找到")
@@ -1783,7 +1868,7 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
             stream << "  " << (index + 1) << ". " << devices[index].ip << "  " << devices[index].mac << "\n";
         }
     }
-    stream << "数据内容  序号、帧号、相对掌心位置、拇指 X/Y 与四指弯曲角";
+    stream << "数据内容  序号、帧号、相对位置、俯仰角、6关节数组";
     return stream.str();
 }
 
@@ -1795,14 +1880,13 @@ void ControllerDiagnosticDemo::UpdateNetworkStreaming() {
     const auto now = std::chrono::steady_clock::now();
     uint64_t sequence_to_send = 0;
     bool should_send = false;
-    const bool trigger_streaming_active = IsTriggerStreamingActive(Side::LEFT) || IsTriggerStreamingActive(Side::RIGHT);
     {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
         if (!network_state_.interface_info.valid) {
             return;
         }
 
-        const bool send_due = (network_state_.udp_enabled || trigger_streaming_active) &&
+        const bool send_due = network_state_.udp_enabled &&
                               (network_state_.packet_sequence == 0 ||
                                now - network_state_.last_send_time >= std::chrono::milliseconds(50));
         if (network_state_.send_snapshot_requested || send_due) {
@@ -1825,6 +1909,14 @@ void ControllerDiagnosticDemo::UpdateNetworkStreaming() {
     }
 
     const std::string payload = BuildUdpPayloadJson(sequence_to_send);
+    const char* target_ip = inet_ntoa(target_addr.sin_addr);
+    const int target_port = ntohs(target_addr.sin_port);
+    __android_log_print(ANDROID_LOG_INFO, "OpenXRControllerDemo",
+                        "UDP send to %s:%d | payload=%s%s",
+                        target_ip ? target_ip : "?", target_port,
+                        payload.substr(0, 160).c_str(),
+                        payload.size() > 160 ? "..." : "");
+
     const int send_result =
             sendto(network_state_.socket_fd, payload.c_str(), static_cast<int>(payload.size()), 0,
                    reinterpret_cast<const sockaddr*>(&target_addr), sizeof(target_addr));
@@ -1832,9 +1924,11 @@ void ControllerDiagnosticDemo::UpdateNetworkStreaming() {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
         network_state_.scan_status =
                 send_result >= 0
-                        ? Fmt("%s，%d 字节", trigger_streaming_active ? "扳机发送中" : "最近一次 UDP 发送成功", send_result)
+                        ? Fmt("%s，%d 字节", "最近一次 UDP 发送成功", send_result)
                         : "UDP 发送失败";
     }
+    __android_log_print(ANDROID_LOG_INFO, "OpenXRControllerDemo",
+                        "UDP send result: %d (errno hint)", send_result);
 }
 
 bool ControllerDiagnosticDemo::InitializeHandTracking() {
@@ -2105,25 +2199,65 @@ void ControllerDiagnosticDemo::DetectInputEvents() {
             {kTouchX, "X"},                       {kTouchY, "Y"},
             {kTouchA, "A"},                       {kTouchB, "B"}};
 
+    constexpr auto kLongPressThreshold = std::chrono::milliseconds(400);
+    const auto now = std::chrono::steady_clock::now();
+
+    auto toggle_udp = [this]() {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        network_state_.udp_enabled = !network_state_.udp_enabled;
+        last_ui_event_ = network_state_.udp_enabled ? "UDP 发送已开启" : "UDP 发送已停止";
+    };
+
+    // X key (left controller): short press toggles UDP, long press calibrates left hand
+    if ((button_down & kButtonX) != 0) {
+        x_press_time_ = now;
+        x_long_triggered_ = false;
+    }
+    if ((button_up & kButtonX) != 0) {
+        if (!x_long_triggered_) {
+            auto duration = now - x_press_time_;
+            if (duration < kLongPressThreshold) {
+                toggle_udp();
+            }
+        }
+    }
+    if ((buttons & kButtonX) != 0 && !x_long_triggered_) {
+        if (now - x_press_time_ >= kLongPressThreshold) {
+            x_long_triggered_ = true;
+            if (current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE) {
+                CalibrateControllerFallbackZero(Side::LEFT);
+            }
+        }
+    }
+
+    // A key (right controller): short press toggles UDP, long press calibrates right hand
+    if ((button_down & kButtonA) != 0) {
+        a_press_time_ = now;
+        a_long_triggered_ = false;
+    }
+    if ((button_up & kButtonA) != 0) {
+        if (!a_long_triggered_) {
+            auto duration = now - a_press_time_;
+            if (duration < kLongPressThreshold) {
+                toggle_udp();
+            }
+        }
+    }
+    if ((buttons & kButtonA) != 0 && !a_long_triggered_) {
+        if (now - a_press_time_ >= kLongPressThreshold) {
+            a_long_triggered_ = true;
+            if (current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE) {
+                CalibrateControllerFallbackZero(Side::RIGHT);
+            }
+        }
+    }
+
     if (button_down != 0) {
         last_ui_event_ = "按键按下： " + describe_bits(button_down, button_names);
     } else if (button_up != 0) {
         last_ui_event_ = "按键抬起： " + describe_bits(button_up, button_names);
     } else if (touch_down != 0) {
         last_ui_event_ = "触摸开始： " + describe_bits(touch_down, touch_names);
-    }
-
-    if ((button_down & kButtonTriggerLeft) != 0 && current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE &&
-        !hand_states_[Side::LEFT].active) {
-        CalibrateControllerFallbackZero(Side::LEFT);
-        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-        network_state_.send_snapshot_requested = true;
-    }
-    if ((button_down & kButtonTriggerRight) != 0 && current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE &&
-        !hand_states_[Side::RIGHT].active) {
-        CalibrateControllerFallbackZero(Side::RIGHT);
-        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-        network_state_.send_snapshot_requested = true;
     }
 
     previous_buttons_ = buttons;
@@ -2137,9 +2271,14 @@ std::string ControllerDiagnosticDemo::BuildControllerText(int hand) const {
     const auto& stick = hand == Side::LEFT ? current_frame_in_.left_joystick_position
                                            : current_frame_in_.right_joystick_position;
 
+    const bool udp_enabled = [this]() {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        return network_state_.udp_enabled;
+    }();
+
     if (current_frame_in_.controller_actives[hand] != XR_TRUE) {
         return Fmt("%s\n连接  未连接\n发送  %s\n扳机 %.2f  握把 %.2f\n电量 %.1f / 5\n摇杆 %.2f, %.2f\n%s", label,
-                   IsTriggerStreamingActive(hand) ? "扳机发送中" : "空闲",
+                   udp_enabled ? "持续发送中" : "空闲",
                    current_frame_in_.controller_trigger_value[hand],
                    current_frame_in_.controller_grip_value[hand], current_frame_in_.controller_battery_value[hand],
                    stick.x, stick.y, BuildButtonSummary(hand).c_str());
@@ -2147,7 +2286,7 @@ std::string ControllerDiagnosticDemo::BuildControllerText(int hand) const {
 
     return Fmt("%s\n连接  已连接\n发送  %s\n握持 %.2f, %.2f, %.2f\n指向 %.2f, %.2f, %.2f\n"
                "扳机 %.2f  握把 %.2f\n电量 %.1f / 5  摇杆 %.2f, %.2f\n%s",
-               label, IsTriggerStreamingActive(hand) ? "扳机发送中" : "空闲",
+               label, udp_enabled ? "持续发送中" : "空闲",
                grip_pose.position.x, grip_pose.position.y, grip_pose.position.z, aim_pose.position.x,
                aim_pose.position.y, aim_pose.position.z, current_frame_in_.controller_trigger_value[hand],
                current_frame_in_.controller_grip_value[hand], current_frame_in_.controller_battery_value[hand], stick.x,

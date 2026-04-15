@@ -1210,9 +1210,15 @@ namespace PVRSampleFW {
                                 if (hand == 0) {
                                     controller_input_value_[Side::LEFT].grip_value = gripValue.currentState;
                                     current_frame_in_.controller_grip_value[Side::LEFT] = gripValue.currentState;
+                                    if (gripValue.currentState > 0.9f) {
+                                        current_frame_in_.all_buttons_bitmask |= XrFrameIn::kButtonGripTriggerLeft;
+                                    }
                                 } else if (hand == 1) {
                                     controller_input_value_[Side::RIGHT].grip_value = gripValue.currentState;
                                     current_frame_in_.controller_grip_value[Side::RIGHT] = gripValue.currentState;
+                                    if (gripValue.currentState > 0.9f) {
+                                        current_frame_in_.all_buttons_bitmask |= XrFrameIn::kButtonGripTriggerRight;
+                                    }
                                 }
                             } else {
                                 if (hand == 0) {
