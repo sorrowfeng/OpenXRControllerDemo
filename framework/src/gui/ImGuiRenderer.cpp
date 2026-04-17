@@ -511,6 +511,39 @@ namespace PVRSampleFW {
             }
         }
 
+        // Draw high-contrast ray cursors directly in the ImGui window so the hit point remains
+        // visible even when the external 3D ray is hidden in passthrough mode.
+        {
+            ImDrawList* drawList = ImGui::GetForegroundDrawList();
+            const ImVec2 windowPos = ImGui::GetWindowPos();
+            const ImVec2 windowSize = ImGui::GetWindowSize();
+            drawList->PushClipRect(windowPos, ImVec2(windowPos.x + windowSize.x, windowPos.y + windowSize.y), true);
+            for (int i = 0; i < 2; ++i) {
+                if (!rayInputEvent.collision[i]) {
+                    continue;
+                }
+
+                const float cursorX = windowPos.x + rayInputEvent.coord_pixel[i].first;
+                const float cursorY = windowPos.y + (config.height - rayInputEvent.coord_pixel[i].second);
+                const ImVec2 center(cursorX, cursorY);
+                const ImU32 outerColor = IM_COL32(18, 22, 28, 220);
+                const ImU32 ringColor = i == rayInputEvent.effective_side
+                                                ? IM_COL32(255, 196, 64, 255)
+                                                : IM_COL32(98, 194, 255, 235);
+                const ImU32 coreColor = rayInputEvent.triggered && i == rayInputEvent.effective_side
+                                                ? IM_COL32(255, 106, 64, 255)
+                                                : IM_COL32(255, 255, 255, 245);
+
+                drawList->AddCircleFilled(center, 18.0f, outerColor, 32);
+                drawList->AddCircle(center, 14.0f, ringColor, 32, 4.0f);
+                drawList->AddCircleFilled(center, rayInputEvent.triggered && i == rayInputEvent.effective_side ? 7.5f : 5.5f,
+                                          coreColor, 24);
+                drawList->AddLine(ImVec2(center.x - 24.0f, center.y), ImVec2(center.x + 24.0f, center.y), ringColor, 2.0f);
+                drawList->AddLine(ImVec2(center.x, center.y - 24.0f), ImVec2(center.x, center.y + 24.0f), ringColor, 2.0f);
+            }
+            drawList->PopClipRect();
+        }
+
         if (config.flags & GUI_WINDOW_CONFIG_TEXT_COLOR) {
             ImGui::PopStyleColor();
         }
@@ -529,23 +562,6 @@ namespace PVRSampleFW {
         glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
-        // 4. Draw point for two ray
-        GLboolean lastEnableScissorTest = glIsEnabled(GL_SCISSOR_TEST);
-        if (lastEnableScissorTest == GL_FALSE) {
-            glEnable(GL_SCISSOR_TEST);
-        }
-        for (int i = 0; i < 2; ++i) {
-            if (rayInputEvent.collision[i]) {
-                glScissor(rayInputEvent.coord_pixel[i].first - POINT_SIZE,
-                          rayInputEvent.coord_pixel[i].second - POINT_SIZE, POINT_SIZE * 2, POINT_SIZE * 2);
-                glClearColor(0.9f, 0.9f, 0.8f, 1.0f);
-                glClear(GL_COLOR_BUFFER_BIT);
-            }
-        }
-        if (lastEnableScissorTest == GL_FALSE) {
-            glDisable(GL_SCISSOR_TEST);
-        }
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 

@@ -12,6 +12,7 @@
 #include "GuiPlane.h"
 #include "GuiWindow.h"
 #include "TruncatedCone.h"
+#include "openxrWrapper/extensions/Passthrough.h"
 #include "imgui.h"
 #include "xr_linear.h"
 
@@ -23,6 +24,7 @@
 #include <array>
 #include <chrono>
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -436,6 +438,10 @@ private:
     void SetDashboardVisible(bool visible);
     void NotifyUdpSender();
     void RunUdpSenderLoop();
+    bool SupportsEnvironmentBlendMode(XrEnvironmentBlendMode mode) const;
+    void InitializePassthroughMode();
+    void ShutdownPassthroughMode();
+    void RefreshPassthroughVisualState();
     void ResetHandZeroPoint(int hand);
     void ResetBothHandsForSending();
     void LoadNetworkPreferences();
@@ -499,6 +505,7 @@ private:
     std::array<int64_t, Side::COUNT> hand_palm_ids_{{-1, -1}};
     std::array<int64_t, Side::COUNT> hand_tip_ids_{{-1, -1}};
     std::array<int64_t, Side::COUNT> hand_aim_ids_{{-1, -1}};
+    int64_t environment_reference_id_{-1};
 
     std::array<std::array<int64_t, XR_HAND_JOINT_COUNT_EXT>, Side::COUNT> hand_joint_ids_{};
     std::array<std::array<int64_t, kHandBoneCount>, Side::COUNT> hand_bone_ids_{};
@@ -551,7 +558,12 @@ private:
     std::chrono::steady_clock::time_point a_press_time_{};
     bool x_long_triggered_{false};
     bool a_long_triggered_{false};
+    bool dashboard_visible_{true};
     UdpDataSource udp_data_source_{UdpDataSource::CONTROLLER};
+    bool passthrough_requested_{true};
+    bool passthrough_supported_{false};
+    bool passthrough_active_{false};
+    std::shared_ptr<Passthrough> passthrough_plugin_{nullptr};
 };
 
 ControllerDiagnosticDemo::ControllerDiagnosticDemo(const std::shared_ptr<Configurations>& appConfig)
@@ -584,6 +596,10 @@ void ControllerDiagnosticDemo::CustomizedExtensionAndFeaturesInit() {
     if (hand_tracking_supported_) {
         non_plugin_extensions_.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
     }
+
+    if (IsExtensionSupported(XR_FB_PASSTHROUGH_EXTENSION_NAME)) {
+        extension_features_manager_->RegisterExtensionFeatures({XR_FB_PASSTHROUGH_EXTENSION_NAME}, this);
+    }
 }
 
 bool ControllerDiagnosticDemo::CustomizedSessionInit() {
@@ -591,6 +607,7 @@ bool ControllerDiagnosticDemo::CustomizedSessionInit() {
 }
 
 void ControllerDiagnosticDemo::CustomizedSessionDestroy() {
+    ShutdownPassthroughMode();
     ShutdownNetworkStreaming();
     DestroyHandTracking();
 }
@@ -605,6 +622,7 @@ bool ControllerDiagnosticDemo::CustomizedAppPostInit() {
     AddHandVisuals();
     AddMainDashboard();
     InitializeNetworkStreaming();
+    InitializePassthroughMode();
     UpdateRuntimeState();
     return true;
 }
@@ -618,6 +636,7 @@ bool ControllerDiagnosticDemo::CustomizedPreRenderFrame() {
     DetectInputEvents();
     UpdateRuntimeState();
     UpdateNetworkStreaming();
+    RefreshPassthroughVisualState();
     return true;
 }
 
@@ -625,9 +644,131 @@ bool ControllerDiagnosticDemo::CustomizedRender() {
     return true;
 }
 
+bool ControllerDiagnosticDemo::SupportsEnvironmentBlendMode(XrEnvironmentBlendMode mode) const {
+    if (GetXrInstance() == XR_NULL_HANDLE || GetXrSystemId() == XR_NULL_SYSTEM_ID) {
+        return false;
+    }
+
+    uint32_t mode_count = 0;
+    XrResult result = xrEnumerateEnvironmentBlendModes(GetXrInstance(), GetXrSystemId(),
+                                                       XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                                       0, &mode_count, nullptr);
+    if (XR_FAILED(result) || mode_count == 0) {
+        return false;
+    }
+
+    std::vector<XrEnvironmentBlendMode> modes(mode_count);
+    result = xrEnumerateEnvironmentBlendModes(GetXrInstance(), GetXrSystemId(),
+                                              XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                              mode_count, &mode_count, modes.data());
+    if (XR_FAILED(result)) {
+        return false;
+    }
+
+    return std::find(modes.begin(), modes.end(), mode) != modes.end();
+}
+
+void ControllerDiagnosticDemo::InitializePassthroughMode() {
+    passthrough_supported_ = false;
+    passthrough_active_ = false;
+    passthrough_plugin_ = nullptr;
+
+    if (!passthrough_requested_) {
+        last_ui_event_ = "透视窗口模式已禁用，保持普通 VR";
+        return;
+    }
+
+    if (!IsExtensionEnabled(XR_FB_PASSTHROUGH_EXTENSION_NAME)) {
+        last_ui_event_ = "当前运行时未启用 XR_FB_passthrough，已回退普通 VR";
+        return;
+    }
+
+    if (!SupportsEnvironmentBlendMode(XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND)) {
+        last_ui_event_ = "当前运行时不支持 AlphaBlend，已回退普通 VR";
+        return;
+    }
+
+    passthrough_plugin_ = std::dynamic_pointer_cast<Passthrough>(
+            extension_features_manager_->GetRegisterExtension(XR_FB_PASSTHROUGH_EXTENSION_NAME));
+    if (passthrough_plugin_ == nullptr) {
+        last_ui_event_ = "透视插件未注册成功，已回退普通 VR";
+        return;
+    }
+
+    const int passthrough_result = passthrough_plugin_->EnableRegularVideoSeeThrough(true);
+    if (XR_FAILED(passthrough_result)) {
+        passthrough_plugin_.reset();
+        last_ui_event_ = Fmt("透视启动失败，错误码 %d，已回退普通 VR", passthrough_result);
+        return;
+    }
+
+    app_config_->SetEnvironmentBlendMode(XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND);
+    graphics_plugin_->UpdateConfigurationsAtGraphics(app_config_);
+    xr_environment_blend_mode_ = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+    passthrough_supported_ = true;
+    passthrough_active_ = true;
+    last_ui_event_ = "已启用 PICO 透视窗口模式";
+    RefreshPassthroughVisualState();
+}
+
+void ControllerDiagnosticDemo::ShutdownPassthroughMode() {
+    if (passthrough_plugin_ != nullptr && passthrough_active_) {
+        passthrough_plugin_->EnableRegularVideoSeeThrough(false);
+    }
+
+    passthrough_active_ = false;
+    passthrough_supported_ = false;
+    passthrough_plugin_.reset();
+    app_config_->SetEnvironmentBlendMode(XR_ENVIRONMENT_BLEND_MODE_OPAQUE);
+    if (graphics_plugin_ != nullptr) {
+        graphics_plugin_->UpdateConfigurationsAtGraphics(app_config_);
+    }
+    xr_environment_blend_mode_ = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+}
+
+void ControllerDiagnosticDemo::RefreshPassthroughVisualState() {
+    auto set_scene_object_visible = [this](SampleSceneType scene_type, int64_t object_id, bool visible) {
+        if (object_id < 0) {
+            return;
+        }
+        if (const auto object = scenes_.at(scene_type).GetObject(object_id); object != nullptr) {
+            object->SetVisible(visible);
+        }
+    };
+
+    set_scene_object_visible(SAMPLE_SCENE_TYPE_ENVIRONMENT, environment_reference_id_, !passthrough_active_);
+
+    if (!passthrough_active_) {
+        for (const auto cube_id : spawned_cube_ids_) {
+            set_scene_object_visible(SAMPLE_SCENE_TYPE_CUSTOM, cube_id, true);
+        }
+        return;
+    }
+
+    for (int hand = 0; hand < Side::COUNT; ++hand) {
+        set_scene_object_visible(SAMPLE_SCENE_TYPE_CONTROLLER, controller_ids_[hand], false);
+        set_scene_object_visible(SAMPLE_SCENE_TYPE_CONTROLLER, aim_ids_[hand], false);
+        set_scene_object_visible(SAMPLE_SCENE_TYPE_CUSTOM, hand_palm_ids_[hand], false);
+        set_scene_object_visible(SAMPLE_SCENE_TYPE_CUSTOM, hand_tip_ids_[hand], false);
+        set_scene_object_visible(SAMPLE_SCENE_TYPE_CUSTOM, hand_aim_ids_[hand], false);
+        set_scene_object_visible(SAMPLE_SCENE_TYPE_RAY, ray_obj_id_[hand], false);
+
+        for (const auto joint_id : hand_joint_ids_[hand]) {
+            set_scene_object_visible(SAMPLE_SCENE_TYPE_CUSTOM, joint_id, false);
+        }
+        for (const auto bone_id : hand_bone_ids_[hand]) {
+            set_scene_object_visible(SAMPLE_SCENE_TYPE_CUSTOM, bone_id, false);
+        }
+    }
+
+    for (const auto cube_id : spawned_cube_ids_) {
+        set_scene_object_visible(SAMPLE_SCENE_TYPE_CUSTOM, cube_id, false);
+    }
+}
+
 void ControllerDiagnosticDemo::AddReferenceObjects() {
     auto& environment_scene = scenes_.at(SAMPLE_SCENE_TYPE_ENVIRONMENT);
-    environment_scene.AddObject(
+    environment_reference_id_ = environment_scene.AddObject(
             std::make_shared<CartesianBranch>(MakePose(0.0f, -0.28f, -1.85f), XrVector3f{0.28f, 0.28f, 0.28f}));
 }
 
@@ -692,6 +833,9 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     int last_send_bytes = 0;
     uint64_t packet_sequence = 0;
     int selected_target_index = 0;
+    std::string latest_payload;
+    const bool passthrough_active = passthrough_active_;
+    const bool passthrough_supported = passthrough_supported_;
     std::string scan_status;
     {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
@@ -706,6 +850,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
         last_send_bytes = network_state_.last_send_bytes;
         packet_sequence = network_state_.packet_sequence;
         selected_target_index = network_state_.selected_target_index;
+        latest_payload = network_state_.latest_payload;
         scan_status = network_state_.scan_status;
     }
 
@@ -728,45 +873,32 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
 
     const auto section_label = [](DashboardSection section) {
         switch (section) {
-            case DashboardSection::Overview: return "总览";
+            case DashboardSection::Overview: return "主页";
             case DashboardSection::Controller: return "手柄";
-            case DashboardSection::Hand: return "手部";
+            case DashboardSection::Hand: return "手势";
             case DashboardSection::Network: return "网络";
-            case DashboardSection::Mapping: return "映射";
+            case DashboardSection::Mapping: return "手势";
         }
-        return "总览";
+        return "主页";
     };
 
     const auto draw_status_badge = [](const char* label, const char* value, const ImVec4& color, float width) {
-        ImGui::PushStyleColor(ImGuiCol_Button, color);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, color);
-        ImGui::Button(label, ImVec2(width, 0.0f));
-        ImGui::PopStyleColor(3);
-        // Fixed single-line display — truncate with "..." so the row height never changes.
-        const float avail_w = ImGui::GetContentRegionAvail().x;
-        const char* text_begin = value;
-        const char* text_end = text_begin + std::strlen(text_begin);
-        const char* clipped_end = ImGui::GetFont()->CalcWordWrapPositionA(
-                ImGui::GetFontSize() / ImGui::GetFont()->FontSize,
-                text_begin, text_end, avail_w);
-        if (clipped_end < text_end) {
-            // Measure "…" width and back up to fit
-            const char* suffix = "...";
-            const float suffix_w = ImGui::CalcTextSize(suffix).x;
-            clipped_end = ImGui::GetFont()->CalcWordWrapPositionA(
-                    ImGui::GetFontSize() / ImGui::GetFont()->FontSize,
-                    text_begin, text_end, avail_w - suffix_w);
-            char buf[256];
-            int copy_len = static_cast<int>(clipped_end - text_begin);
-            if (copy_len < 0) copy_len = 0;
-            if (copy_len > 250) copy_len = 250;
-            std::memcpy(buf, text_begin, copy_len);
-            std::memcpy(buf + copy_len, suffix, 4);
-            ImGui::TextUnformatted(buf, buf + copy_len + 3);
-        } else {
-            ImGui::TextUnformatted(text_begin, text_end);
-        }
+        const float badge_width = width > 0.0f ? width : ImGui::GetContentRegionAvail().x;
+        const ImVec4 border_color = ImVec4(
+                std::clamp(color.x - 0.12f, 0.0f, 1.0f),
+                std::clamp(color.y - 0.12f, 0.0f, 1.0f),
+                std::clamp(color.z - 0.12f, 0.0f, 1.0f),
+                1.0f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, color);
+        ImGui::PushStyleColor(ImGuiCol_Border, border_color);
+        ImGui::BeginChild(label, ImVec2(badge_width, 86.0f), true, ImGuiWindowFlags_NoScrollbar);
+        ImGui::TextColored(ImVec4(0.16f, 0.20f, 0.28f, 0.92f), "%s", label);
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(ImVec4(0.08f, 0.12f, 0.18f, 1.0f), "%s", value);
+        ImGui::PopTextWrapPos();
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
     };
 
     const auto draw_card = [](const char* title, const ImVec2& size, const std::function<void()>& body) {
@@ -792,6 +924,127 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
         ImGui::PushTextWrapPos();
         ImGui::TextUnformatted(text.c_str());
         ImGui::PopTextWrapPos();
+    };
+
+    const auto format_json_for_panel = [](const std::string& json) {
+        if (json.empty()) {
+            return std::string("{}");
+        }
+        std::string formatted;
+        formatted.reserve(json.size() * 2);
+        int indent = 0;
+        bool in_string = false;
+        bool escaping = false;
+        for (char ch : json) {
+            if (escaping) {
+                formatted.push_back(ch);
+                escaping = false;
+                continue;
+            }
+            if (ch == '\\') {
+                formatted.push_back(ch);
+                if (in_string) {
+                    escaping = true;
+                }
+                continue;
+            }
+            if (ch == '"') {
+                in_string = !in_string;
+                formatted.push_back(ch);
+                continue;
+            }
+            if (in_string) {
+                formatted.push_back(ch);
+                continue;
+            }
+
+            switch (ch) {
+                case '{':
+                case '[':
+                    formatted.push_back(ch);
+                    formatted.push_back('\n');
+                    indent++;
+                    formatted.append(indent * 2, ' ');
+                    break;
+                case '}':
+                case ']':
+                    formatted.push_back('\n');
+                    indent = std::max(0, indent - 1);
+                    formatted.append(indent * 2, ' ');
+                    formatted.push_back(ch);
+                    break;
+                case ',':
+                    formatted.push_back(ch);
+                    formatted.push_back('\n');
+                    formatted.append(indent * 2, ' ');
+                    break;
+                case ':':
+                    formatted.append(": ");
+                    break;
+                default:
+                    if (!std::isspace(static_cast<unsigned char>(ch))) {
+                        formatted.push_back(ch);
+                    }
+                    break;
+            }
+        }
+        return formatted;
+    };
+
+    const auto split_hand_json = [](const std::string& payload) {
+        std::array<std::string, 2> hand_jsons{};
+        const size_t hands_pos = payload.find("\"hands\"");
+        if (hands_pos == std::string::npos) {
+            return hand_jsons;
+        }
+        const size_t list_begin = payload.find('[', hands_pos);
+        if (list_begin == std::string::npos) {
+            return hand_jsons;
+        }
+
+        size_t cursor = list_begin + 1;
+        for (int hand_index = 0; hand_index < 2 && cursor < payload.size(); ++hand_index) {
+            while (cursor < payload.size() && (std::isspace(static_cast<unsigned char>(payload[cursor])) || payload[cursor] == ',')) {
+                ++cursor;
+            }
+            if (cursor >= payload.size() || payload[cursor] != '{') {
+                break;
+            }
+
+            const size_t object_begin = cursor;
+            int depth = 0;
+            bool in_string = false;
+            bool escaping = false;
+            for (; cursor < payload.size(); ++cursor) {
+                const char ch = payload[cursor];
+                if (escaping) {
+                    escaping = false;
+                    continue;
+                }
+                if (ch == '\\' && in_string) {
+                    escaping = true;
+                    continue;
+                }
+                if (ch == '"') {
+                    in_string = !in_string;
+                    continue;
+                }
+                if (in_string) {
+                    continue;
+                }
+                if (ch == '{') {
+                    ++depth;
+                } else if (ch == '}') {
+                    --depth;
+                    if (depth == 0) {
+                        hand_jsons[hand_index] = payload.substr(object_begin, cursor - object_begin + 1);
+                        ++cursor;
+                        break;
+                    }
+                }
+            }
+        }
+        return hand_jsons;
     };
 
     const auto draw_nav_button = [&](DashboardSection section) {
@@ -830,137 +1083,162 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     draw_nav_button(DashboardSection::Controller);
     draw_nav_button(DashboardSection::Hand);
     draw_nav_button(DashboardSection::Network);
-    draw_nav_button(DashboardSection::Mapping);
     ImGui::Spacing();
-    draw_status_badge("拖动窗口", "扳机键拖动", ImVec4(0.92f, 0.94f, 0.98f, 1.0f), -1.0f);
-    ImGui::TextWrapped("按住扳机键并移动控制器，可拖动窗口位置。");
+    ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 1.0f), "拖动窗口");
+    ImGui::TextWrapped("按住扳机键并移动控制器。");
     ImGui::Spacing();
-    draw_status_badge("快捷按键", "X / A", ImVec4(0.96f, 0.96f, 0.97f, 1.0f), -1.0f);
-    ImGui::TextWrapped("点按 A：未发送时开启发送并隐藏窗口，发送中时停止发送并显示窗口。长按 A：同时重置左右手零点。");
+    ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 1.0f), "快捷键");
+    ImGui::TextWrapped("A 点按切发送，长按重置双手；B 点按切换窗口显隐。");
     ImGui::EndChild();
 
     ImGui::SameLine();
 
     ImGui::BeginChild("content", ImVec2(0, 0), false);
-    ImGui::TextColored(ImVec4(0.08f, 0.12f, 0.18f, 1.0f), "OpenXR 控制台");
-    ImGui::TextColored(ImVec4(0.38f, 0.44f, 0.52f, 1.0f), "当前页面：%s", section_label(dashboard_section_));
-    ImGui::Separator();
-
-    ImGui::Columns(5, "top_badges", false);
-    draw_status_badge("最近事件", last_ui_event_.c_str(), ImVec4(0.82f, 0.91f, 1.0f, 1.0f), -1.0f);
-    ImGui::NextColumn();
-    draw_status_badge("手追状态", hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str(),
-                      hand_tracking_ready_ ? ImVec4(0.72f, 0.92f, 0.80f, 1.0f) : ImVec4(1.0f, 0.84f, 0.72f, 1.0f), -1.0f);
-    ImGui::NextColumn();
-    const std::string send_badge_text =
-            udp_enabled ? Fmt("持续发送中 %.1f Hz", actual_send_rate_hz) : "空闲";
-    draw_status_badge("发送状态", send_badge_text.c_str(),
-                      udp_enabled ? ImVec4(0.72f, 0.88f, 1.0f, 1.0f)
-                                  : ImVec4(0.90f, 0.90f, 0.92f, 1.0f),
-                      -1.0f);
-    ImGui::NextColumn();
-    draw_status_badge("数据源",
-                      udp_data_source_ == UdpDataSource::HAND ? "手势数据" : "手柄数据",
-                      udp_data_source_ == UdpDataSource::HAND
-                              ? ImVec4(0.72f, 0.92f, 0.80f, 1.0f)
-                              : ImVec4(0.88f, 0.80f, 0.96f, 1.0f),
-                      -1.0f);
-    ImGui::NextColumn();
-    draw_status_badge("连接状态", interface_info.valid ? "局域网已连接" : "局域网未连接",
-                      interface_info.valid ? ImVec4(0.76f, 0.93f, 0.82f, 1.0f) : ImVec4(1.0f, 0.88f, 0.80f, 1.0f), -1.0f);
-    ImGui::Columns(1);
-
-    ImGui::Spacing();
+    if (dashboard_section_ != DashboardSection::Overview) {
+        ImGui::TextColored(ImVec4(0.08f, 0.12f, 0.18f, 1.0f), "OpenXR 控制台");
+        ImGui::TextColored(ImVec4(0.38f, 0.44f, 0.52f, 1.0f), "当前页面：%s | 显示模式：%s",
+                           section_label(dashboard_section_),
+                           passthrough_active ? "PICO 透视" : (passthrough_supported ? "VR 回退" : "普通 VR"));
+        ImGui::Separator();
+        ImGui::Columns(4, "top_badges", false);
+        draw_status_badge("最近事件", last_ui_event_.c_str(), ImVec4(0.82f, 0.91f, 1.0f, 1.0f), -1.0f);
+        ImGui::NextColumn();
+        draw_status_badge("手追状态", hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str(),
+                          hand_tracking_ready_ ? ImVec4(0.72f, 0.92f, 0.80f, 1.0f) : ImVec4(1.0f, 0.84f, 0.72f, 1.0f), -1.0f);
+        ImGui::NextColumn();
+        const std::string send_badge_text =
+                udp_enabled ? Fmt("持续发送中 %.1f Hz", actual_send_rate_hz) : "空闲";
+        draw_status_badge("发送状态", send_badge_text.c_str(),
+                          udp_enabled ? ImVec4(0.72f, 0.88f, 1.0f, 1.0f)
+                                      : ImVec4(0.90f, 0.90f, 0.92f, 1.0f),
+                          -1.0f);
+        ImGui::NextColumn();
+        draw_status_badge("连接状态", interface_info.valid ? "局域网已连接" : "局域网未连接",
+                          interface_info.valid ? ImVec4(0.76f, 0.93f, 0.82f, 1.0f) : ImVec4(1.0f, 0.88f, 0.80f, 1.0f), -1.0f);
+        ImGui::Columns(1);
+        ImGui::Spacing();
+    }
 
     if (dashboard_section_ == DashboardSection::Overview) {
         ImGui::BeginChild("overview_grid", ImVec2(0, -170.0f), false);
-        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：点按 A 切换发送并联动显隐窗口 | 长按 A 同时重置左右手");
-        ImGui::Columns(3, "overview_cols", false);
-        draw_card("运行总览", ImVec2(0, 300.0f), [&]() {
-            draw_big_text(Fmt("当前帧  %lld\n预测显示  %.3f 秒\n在线手柄  %d / 2\n在线手部  %d / 2\n"
-                              "手追扩展  %s\n追踪器  %s",
-                              static_cast<long long>(current_frame_in_.frame_number),
-                              SecondsFromXrTime(current_frame_in_.predicted_display_time),
-                              active_controllers, active_hands,
-                              hand_tracking_supported_ ? "已启用" : "缺失",
-                              hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str()));
-        });
+        ImGui::Columns(4, "overview_status_badges", false);
+        draw_status_badge("发送状态",
+                          udp_enabled ? Fmt("持续发送 %.1f Hz", actual_send_rate_hz).c_str() : "当前空闲",
+                          udp_enabled ? ImVec4(0.72f, 0.88f, 1.0f, 1.0f)
+                                      : ImVec4(0.92f, 0.92f, 0.94f, 1.0f),
+                          -1.0f);
         ImGui::NextColumn();
-        draw_card("输入摘要", ImVec2(0, 300.0f), [&]() {
-            draw_big_text(Fmt("左手柄  %s\n扳机 %.2f  握把 %.2f\n\n右手柄  %s\n扳机 %.2f  握把 %.2f\n\n%s",
-                              current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE ? "在线" : "离线",
-                              current_frame_in_.controller_trigger_value[Side::LEFT],
-                              current_frame_in_.controller_grip_value[Side::LEFT],
-                              current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE ? "在线" : "离线",
-                              current_frame_in_.controller_trigger_value[Side::RIGHT],
-                              current_frame_in_.controller_grip_value[Side::RIGHT],
-                              BuildCalibrationStatusText().c_str()));
-        });
+        draw_status_badge("网络状态",
+                          interface_info.valid ? Fmt("已连接 %s", interface_info.local_ip.c_str()).c_str() : "未连接局域网",
+                          interface_info.valid ? ImVec4(0.76f, 0.93f, 0.82f, 1.0f)
+                                               : ImVec4(1.0f, 0.88f, 0.80f, 1.0f),
+                          -1.0f);
         ImGui::NextColumn();
-        draw_card("网络摘要", ImVec2(0, 300.0f), [&]() {
-            draw_big_text(Fmt("接口  %s\n本机  %s\n目标  %s\n端口  %u\n设备数  %d\n发送  %s",
-                              interface_info.interface_name.empty() ? "未找到" : interface_info.interface_name.c_str(),
-                              interface_info.local_ip.empty() ? "无" : interface_info.local_ip.c_str(),
-                              selected_target.c_str(), static_cast<unsigned int>(udp_port),
-                              static_cast<int>(devices.size()),
-                              udp_enabled ? Fmt("持续发送中 %.1f Hz", actual_send_rate_hz).c_str() : "空闲"));
-        });
+        draw_status_badge("手追状态",
+                          hand_tracking_ready_ ? Fmt("在线 %d / 2", active_hands).c_str() : hand_tracking_create_error_.c_str(),
+                          hand_tracking_ready_ ? ImVec4(0.72f, 0.92f, 0.80f, 1.0f)
+                                               : ImVec4(1.0f, 0.84f, 0.72f, 1.0f),
+                          -1.0f);
+        ImGui::NextColumn();
+        draw_status_badge("数据源",
+                          udp_data_source_ == UdpDataSource::HAND ? "手势数据" : "手柄数据",
+                          udp_data_source_ == UdpDataSource::HAND
+                                  ? ImVec4(0.80f, 0.93f, 0.84f, 1.0f)
+                                  : ImVec4(0.90f, 0.84f, 0.98f, 1.0f),
+                          -1.0f);
         ImGui::Columns(1);
+        ImGui::Spacing();
+        const std::array<std::string, 2> hand_payloads = split_hand_json(latest_payload);
+        const std::string left_pretty_json = format_json_for_panel(
+                hand_payloads[Side::LEFT].empty() ? "{\"hand\":\"left\"}" : hand_payloads[Side::LEFT]);
+        const std::string right_pretty_json = format_json_for_panel(
+                hand_payloads[Side::RIGHT].empty() ? "{\"hand\":\"right\"}" : hand_payloads[Side::RIGHT]);
+        draw_card("状态边栏", ImVec2(300.0f, 0), [&]() {
+            draw_big_text(Fmt("发送  %s\n目标  %s\n频率  %d / %.1f Hz\n数据源  %s\n在线手柄  %d / 2\n在线手部  %d / 2\n窗口  %s\n显示  %s\n校准  %s",
+                              udp_enabled ? "持续发送中" : "空闲",
+                              selected_target.c_str(),
+                              send_rate_hz,
+                              actual_send_rate_hz,
+                              udp_data_source_ == UdpDataSource::HAND ? "手势数据" : "手柄数据",
+                              active_controllers,
+                              active_hands,
+                              dashboard_visible_ ? "显示" : "隐藏",
+                              passthrough_active ? "PICO 透视窗口" : "普通 VR",
+                              BuildCalibrationStatusText().c_str()));
+            ImGui::Separator();
+            draw_big_text(Fmt("端口  %u\n本机  %s\n最近发送  %d 字节\n已发包  %llu\n手追  %s\n最近事件  %s",
+                              static_cast<unsigned int>(udp_port),
+                              interface_info.local_ip.empty() ? "-" : interface_info.local_ip.c_str(),
+                              last_send_bytes,
+                              static_cast<unsigned long long>(packet_sequence),
+                              hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str(),
+                              last_ui_event_.c_str()));
+        });
+        ImGui::SameLine();
+        draw_card("实时 JSON 源数据", ImVec2(0, 0), [&]() {
+            if (udp_enabled && !latest_payload.empty()) {
+                ImGui::Columns(2, "json_columns", false);
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.96f, 0.98f, 1.0f, 0.95f));
+                ImGui::BeginChild("left_json_card", ImVec2(0, 0), true, ImGuiWindowFlags_NoScrollbar);
+                ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 0.82f), "左手 JSON");
+                ImGui::Separator();
+                ImGui::PushTextWrapPos();
+                ImGui::TextUnformatted(left_pretty_json.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::EndChild();
+                ImGui::NextColumn();
+                ImGui::BeginChild("right_json_card", ImVec2(0, 0), true, ImGuiWindowFlags_NoScrollbar);
+                ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 0.82f), "右手 JSON");
+                ImGui::Separator();
+                ImGui::PushTextWrapPos();
+                ImGui::TextUnformatted(right_pretty_json.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+                ImGui::Columns(1);
+            } else {
+                ImGui::Dummy(ImVec2(0.0f, 80.0f));
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 40.0f);
+                draw_big_text("当前未持续发送。\n\n开启发送后，这里会在主页中央实时显示格式化后的 JSON 源数据。");
+            }
+        });
         ImGui::EndChild();
     } else if (dashboard_section_ == DashboardSection::Controller) {
         ImGui::BeginChild("controller_grid", ImVec2(0, -170.0f), false);
-        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：点按 A 切换发送并联动显示窗口；长按 A 同时重置左右手");
-        ImGui::Columns(3, "controller_cols", false);
-        draw_card("左手柄", ImVec2(0, 420.0f), [&]() { draw_big_text(BuildControllerText(Side::LEFT)); });
+        ImGui::Columns(2, "controller_cols", false);
+        draw_card("左手柄", ImVec2(0, 0), [&]() { draw_big_text(BuildControllerText(Side::LEFT)); });
         ImGui::NextColumn();
-        draw_card("右手柄", ImVec2(0, 420.0f), [&]() { draw_big_text(BuildControllerText(Side::RIGHT)); });
-        ImGui::NextColumn();
-        draw_card("输入与联调", ImVec2(0, 420.0f), [&]() {
+        draw_card("右手柄", ImVec2(0, 0), [&]() { draw_big_text(BuildControllerText(Side::RIGHT)); });
+        ImGui::Columns(1);
+        draw_card("按键摘要", ImVec2(0, 200.0f), [&]() {
             draw_big_text(Fmt("左手输入\n%s\n\n右手输入\n%s\n\n当前目标\n%s",
                               BuildButtonSummary(Side::LEFT).c_str(),
                               BuildButtonSummary(Side::RIGHT).c_str(),
                               selected_target.c_str()));
         });
-        ImGui::Columns(1);
         ImGui::EndChild();
     } else if (dashboard_section_ == DashboardSection::Hand) {
         ImGui::BeginChild("hand_grid", ImVec2(0, -170.0f), false);
-        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：手部页可查看追踪状态，映射页查看关节角度与校准结果");
         ImGui::Columns(2, "hand_cols", false);
-        draw_card("左手追踪", ImVec2(0, 430.0f), [&]() { draw_big_text(BuildHandText(Side::LEFT)); });
+        draw_card("左手手势", ImVec2(0, 440.0f), [&]() { draw_big_text(BuildHandText(Side::LEFT)); });
         ImGui::NextColumn();
-        draw_card("右手追踪", ImVec2(0, 430.0f), [&]() { draw_big_text(BuildHandText(Side::RIGHT)); });
+        draw_card("右手手势", ImVec2(0, 440.0f), [&]() { draw_big_text(BuildHandText(Side::RIGHT)); });
         ImGui::Columns(1);
-        draw_card("手势与校准", ImVec2(0, 0), [&]() {
+        draw_card("映射与校准", ImVec2(0, 0), [&]() {
             ImGui::Columns(2, "gesture_cols", false);
-            draw_big_text(Fmt("左手手势\n%s", BuildHandGestureSummary(Side::LEFT).c_str()));
+            draw_big_text(Fmt("左手映射\n%s", BuildRobotMappingText(Side::LEFT).c_str()));
             ImGui::NextColumn();
-            draw_big_text(Fmt("右手手势\n%s", BuildHandGestureSummary(Side::RIGHT).c_str()));
+            draw_big_text(Fmt("右手映射\n%s", BuildRobotMappingText(Side::RIGHT).c_str()));
             ImGui::Columns(1);
             ImGui::Separator();
             draw_big_text(BuildCalibrationStatusText());
         });
         ImGui::EndChild();
-    } else if (dashboard_section_ == DashboardSection::Mapping) {
-        ImGui::BeginChild("mapping_grid", ImVec2(0, -170.0f), false);
-        ImGui::Columns(2, "mapping_cols", false);
-        draw_card("左手映射", ImVec2(0, 430.0f), [&]() { draw_big_text(BuildRobotMappingText(Side::LEFT)); });
-        ImGui::NextColumn();
-        draw_card("右手映射", ImVec2(0, 430.0f), [&]() { draw_big_text(BuildRobotMappingText(Side::RIGHT)); });
-        ImGui::Columns(1);
-        draw_card("映射说明", ImVec2(0, 0), [&]() {
-            draw_big_text("当前映射重点\n拇指 X 侧摆\n拇指 Y 弯曲\n食指/中指/无名指/小指弯曲\n\n"
-                          "校准后掌心位置和角度都会以当前姿态作为 0 点。");
-        });
-        ImGui::EndChild();
     } else {
         ImGui::BeginChild("network_grid", ImVec2(0, -170.0f), false);
-        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：先扫描局域网 → 选中目标 → 开启 UDP 才会发送 JSON 数据");
         ImGui::Columns(2, "network_cols", false);
 
-        // 左侧：关键状态高亮显示
-        draw_card("网络状态", ImVec2(0, 0), [&]() {
-            // 目标地址
+        draw_card("网络配置", ImVec2(0, 0), [&]() {
             ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "目标地址");
             ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%s", selected_target.c_str());
             ImGui::Spacing();
@@ -983,7 +1261,6 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                     ApplyManualTargetIp("");
                 }
             }
-            // 手柄友好的快速 IP 调整（无需键盘输入）
             {
                 static int edit_octet = 3; // 0~3 对应第 1~4 段
                 auto get_octets = [](const std::string& ip, int out[4]) -> bool {
@@ -1070,7 +1347,6 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             }
             ImGui::Separator();
 
-            // 端口
             ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "UDP 端口");
             ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%u", static_cast<unsigned int>(udp_port));
             ImGui::Separator();
@@ -1087,7 +1363,6 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             if (ImGui::Button("100Hz", ImVec2(78, 38))) SetUdpSendRateHz(100);
             ImGui::Separator();
 
-            // 发送状态（大且醒目）
             ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "发送状态");
             if (udp_enabled) {
                 ImGui::TextColored(ImVec4(0.12f, 0.68f, 0.38f, 1.0f), "持续发送中");
@@ -1096,7 +1371,6 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             }
             ImGui::Separator();
 
-            // 数据源
             ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "数据源");
             ImGui::TextColored(udp_data_source_ == UdpDataSource::HAND
                                        ? ImVec4(0.12f, 0.68f, 0.38f, 1.0f)
@@ -1104,7 +1378,6 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                                "%s", udp_data_source_ == UdpDataSource::HAND ? "手势数据" : "手柄数据");
             ImGui::Separator();
 
-            // 已发包
             ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "已发包数");
             ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%llu",
                                static_cast<unsigned long long>(packet_sequence));
@@ -1114,18 +1387,16 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%d 字节", last_send_bytes);
             ImGui::Separator();
 
-            // 本机与接口
             ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 1.0f), "本机 %s", interface_info.local_ip.empty() ? "-" : interface_info.local_ip.c_str());
             ImGui::TextColored(ImVec4(0.36f, 0.42f, 0.50f, 1.0f), "接口 %s", interface_info.interface_name.empty() ? "-" : interface_info.interface_name.c_str());
 
-            // 扫描/发送状态提示
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.62f, 1.0f), "%s",
                                scan_in_progress ? "扫描中..." : scan_status.c_str());
         });
 
         ImGui::NextColumn();
-        draw_card("设备列表", ImVec2(0, 0), [&]() {
+        draw_card("可用设备", ImVec2(0, 0), [&]() {
             ImGui::BeginChild("device_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
             if (devices.empty()) {
                 ImGui::TextWrapped("暂无可用 IP，请先扫描局域网。");
@@ -1150,12 +1421,12 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     ImGui::SameLine();
     ImGui::Separator();
     ImGui::BeginChild("actions", ImVec2(0, 132.0f), false);
-    ImGui::Columns(6, "action_cols", false);
+    ImGui::Columns(4, "action_cols", false);
     switch (dashboard_section_) {
         case DashboardSection::Overview:
-            draw_common_actions();
-            ImGui::NextColumn();
-            draw_controller_actions();
+            draw_action_button(udp_enabled ? "停止发送" : "开始发送",
+                               udp_enabled ? ImVec4(0.90f, 0.46f, 0.38f, 1.0f) : ImVec4(0.18f, 0.72f, 0.52f, 1.0f),
+                               [&]() { ToggleUdpSending(); });
             ImGui::NextColumn();
             draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() { QueueSingleFrameSend(); });
             ImGui::NextColumn();
@@ -1167,26 +1438,33 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                                    last_ui_event_ = Fmt("UDP 数据源已切换为 %s",
                                                         udp_data_source_ == UdpDataSource::HAND ? "手势数据" : "手柄数据");
                                });
-            break;
-        case DashboardSection::Controller:
-            draw_controller_actions();
-            ImGui::NextColumn();
-            draw_action_button("切到网络", ImVec4(0.16f, 0.66f, 0.86f, 1.0f), [&]() { SetDashboardSection(DashboardSection::Network); });
             ImGui::NextColumn();
             draw_action_button("面板居中", ImVec4(0.22f, 0.56f, 0.96f, 1.0f), [&]() { ResetPanelPose(); });
+            break;
+        case DashboardSection::Controller:
+            draw_action_button("左手震动", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() { PulseController(Side::LEFT); });
             ImGui::NextColumn();
-            draw_action_button("开始校准", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { BeginHandCalibration(); });
+            draw_action_button("右手震动", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() { PulseController(Side::RIGHT); });
             ImGui::NextColumn();
-            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() { QueueSingleFrameSend(); });
+            draw_action_button(udp_enabled ? "停止发送" : "开始发送",
+                               udp_enabled ? ImVec4(0.90f, 0.46f, 0.38f, 1.0f) : ImVec4(0.18f, 0.72f, 0.52f, 1.0f),
+                               [&]() { ToggleUdpSending(); });
+            ImGui::NextColumn();
+            draw_action_button("面板居中", ImVec4(0.22f, 0.56f, 0.96f, 1.0f), [&]() { ResetPanelPose(); });
             break;
         case DashboardSection::Hand:
             draw_action_button("开始校准", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { BeginHandCalibration(); });
             ImGui::NextColumn();
             draw_action_button("清除校准", ImVec4(0.84f, 0.88f, 0.93f, 1.0f), [&]() { ClearHandCalibration(); });
             ImGui::NextColumn();
-            draw_action_button("切到映射", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() { SetDashboardSection(DashboardSection::Mapping); });
-            ImGui::NextColumn();
-            draw_action_button("扫描局域网", ImVec4(0.16f, 0.66f, 0.86f, 1.0f), [&]() { StartLanScan(); });
+            draw_action_button(udp_data_source_ == UdpDataSource::HAND ? "切手柄源" : "切手势源",
+                               ImVec4(0.88f, 0.80f, 0.96f, 1.0f), [&]() {
+                                   udp_data_source_ = (udp_data_source_ == UdpDataSource::HAND)
+                                                            ? UdpDataSource::CONTROLLER
+                                                            : UdpDataSource::HAND;
+                                   last_ui_event_ = Fmt("UDP 数据源已切换为 %s",
+                                                        udp_data_source_ == UdpDataSource::HAND ? "手势数据" : "手柄数据");
+                               });
             ImGui::NextColumn();
             draw_action_button("面板居中", ImVec4(0.22f, 0.56f, 0.96f, 1.0f), [&]() { ResetPanelPose(); });
             break;
@@ -1211,17 +1489,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                                });
             break;
         case DashboardSection::Mapping:
-            draw_action_button("开始校准", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { BeginHandCalibration(); });
-            ImGui::NextColumn();
-            draw_action_button("清除校准", ImVec4(0.84f, 0.88f, 0.93f, 1.0f), [&]() { ClearHandCalibration(); });
-            ImGui::NextColumn();
-            draw_action_button("切到手部", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() { SetDashboardSection(DashboardSection::Hand); });
-            ImGui::NextColumn();
-            draw_action_button("扫描局域网", ImVec4(0.16f, 0.66f, 0.86f, 1.0f), [&]() { StartLanScan(); });
-            ImGui::NextColumn();
-            draw_action_button("UDP 开关", ImVec4(0.22f, 0.56f, 0.96f, 1.0f), [&]() { ToggleUdpSending(); });
-            ImGui::NextColumn();
-            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() { QueueSingleFrameSend(); });
+            draw_action_button("切到手势", ImVec4(0.72f, 0.80f, 0.96f, 1.0f), [&]() { SetDashboardSection(DashboardSection::Hand); });
             break;
     }
     ImGui::Columns(1);
@@ -1236,19 +1504,19 @@ void ControllerDiagnosticDemo::SetDashboardSection(DashboardSection section) {
 
     switch (section) {
         case DashboardSection::Overview:
-            last_ui_event_ = "已切换到总览";
+            last_ui_event_ = "已切换到主页";
             break;
         case DashboardSection::Controller:
             last_ui_event_ = "已切换到手柄页";
             break;
         case DashboardSection::Hand:
-            last_ui_event_ = "已切换到手部页";
+            last_ui_event_ = "已切换到手势页";
             break;
         case DashboardSection::Network:
             last_ui_event_ = "已切换到网络页";
             break;
         case DashboardSection::Mapping:
-            last_ui_event_ = "已切换到映射页";
+            last_ui_event_ = "已切换到手势页";
             break;
     }
 }
@@ -1431,6 +1699,7 @@ void ControllerDiagnosticDemo::SetUdpSendRateHz(int send_rate_hz) {
 }
 
 void ControllerDiagnosticDemo::SetDashboardVisible(bool visible) {
+    dashboard_visible_ = visible;
     if (dashboard_plane_ != nullptr) {
         dashboard_plane_->SetVisible(visible);
     }
@@ -2708,6 +2977,7 @@ void ControllerDiagnosticDemo::DetectInputEvents() {
     constexpr auto kShortPressThreshold = std::chrono::milliseconds(250);
     constexpr auto kLongPressThreshold = std::chrono::milliseconds(650);
     const auto now = std::chrono::steady_clock::now();
+    bool custom_event_handled = false;
 
     // A key (right controller): short press toggles UDP sending, long press resets both hands zero point
     if ((button_down & kButtonA) != 0) {
@@ -2728,11 +2998,18 @@ void ControllerDiagnosticDemo::DetectInputEvents() {
         }
     }
 
-    if (button_down != 0) {
+    // B key (right controller): short press toggles dashboard visibility independently.
+    if ((button_up & kButtonB) != 0) {
+        SetDashboardVisible(!dashboard_visible_);
+        last_ui_event_ = dashboard_visible_ ? "已通过 B 显示主窗口" : "已通过 B 隐藏主窗口";
+        custom_event_handled = true;
+    }
+
+    if (!custom_event_handled && button_down != 0) {
         last_ui_event_ = "按键按下： " + describe_bits(button_down, button_names);
-    } else if (button_up != 0) {
+    } else if (!custom_event_handled && button_up != 0) {
         last_ui_event_ = "按键抬起： " + describe_bits(button_up, button_names);
-    } else if (touch_down != 0) {
+    } else if (!custom_event_handled && touch_down != 0) {
         last_ui_event_ = "触摸开始： " + describe_bits(touch_down, touch_names);
     }
 
