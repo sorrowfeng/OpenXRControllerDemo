@@ -54,7 +54,7 @@
   - 更新校准状态
   - 处理窗口拖动
   - 处理输入事件
-  - 更新 UDP 发送
+  - 更新 UDP 最新快照与网络状态
 - `CustomizedRender()`
   - 走 OpenXR + graphics plugin 正常渲染路径
 
@@ -312,6 +312,8 @@
 相关方法：
 
 - `InitializeNetworkStreaming()`
+- `RunUdpSenderLoop()`
+- `NotifyUdpSender()`
 - `StartLanScan()`
 - `AdvanceSelectedLanTarget(int delta)`
 - `BuildSelectedTargetLabel()`
@@ -329,6 +331,11 @@
 - 支持广播目标
 - 支持持续 UDP 发送
 - 支持发送一帧 snapshot
+- 支持目标发送频率档位：
+  - `100Hz`
+  - `200Hz`
+  - `500Hz`
+  - `1000Hz`
 - UI 中显示：
   - 是否已连接局域网
   - 当前接口名
@@ -336,11 +343,49 @@
   - 广播地址
   - 端口
   - 当前目标
+  - 目标频率
+  - 实际频率
   - 扫描状态
   - 已发包数量
+  - 最近发送字节数
   - 设备总数
 
 网络页当前已经改成支持“全部设备滚动显示”。
+
+### 7.1 UDP 发送架构的重要变化
+
+这一条是最近最关键的更新：
+
+- 旧实现：
+  - `UpdateNetworkStreaming()` 在 `CustomizedPreRenderFrame()` 里每帧只调一次
+  - 所以即使 UI 选了 `200 / 500 / 1000Hz`
+  - 实际仍会被头显渲染帧率卡住
+- 新实现：
+  - `UpdateNetworkStreaming()` 只负责生成“最新 UDP 快照”并缓存到 `network_state_.latest_payload`
+  - 真正发包改到独立线程 `RunUdpSenderLoop()`
+  - 发送线程通过 `condition_variable` 被唤醒
+  - 按 `send_rate_hz` 自己定时发包，不再受渲染帧率限制
+
+当前 `NetworkStreamingState` 新增的关键字段包括：
+
+- `sender_thread_exit`
+- `actual_send_rate_hz`
+- `last_send_bytes`
+- `latest_payload`
+- `sender_cv`
+- `sender_thread`
+
+这意味着：
+
+- `100 / 200 / 500 / 1000Hz` 现在是“真实发送频率目标”
+- 网络页显示的“实际 Hz”来自发送线程每秒统计值
+- 后台日志会打印：
+  - `UDP streaming actual xxx.x Hz (target yyy Hz, target ...)`
+
+注意：
+
+- 不要把这条独立发送线程逻辑再改回每帧发送
+- 如果下一个 agent 需要继续调速率问题，优先看 `RunUdpSenderLoop()`，不是旧的 `UpdateNetworkStreaming()` 节流逻辑
 
 ### 8. UDP JSON 输出内容
 
@@ -437,21 +482,18 @@
 截至本次交接，工作区有未提交改动：
 
 - `app/src/main/cpp/main.cpp`
-- `framework/src/gui/GuiWindow.cpp`
-- `framework/src/gui/GuiWindow.h`
-- `framework/src/gui/ImGuiRenderer.cpp`
 
 这些改动主要对应：
 
-- 原生 ImGui dashboard
-- GuiWindow 自定义渲染回调
-- 中文字体 / 缩放 / 对齐
-- dashboard 旧兼容逻辑清理
+- UDP 独立发送线程
+- 真实发送频率统计
+- 网络页“目标 Hz / 实际 Hz / 最近发送字节数”显示
+- 发送线程唤醒与关闭流程
 
 注意：
 
 - 不要为了“回到干净状态”去误回滚这些文件
-- 当前这几处正是最新 UI 架构的核心
+- 当前这处改动正是最新 UDP 发送架构的核心
 
 ## 当前已验证事实
 
@@ -460,11 +502,13 @@
 - `assembleDebug` 可以通过
 - APK 可以安装到设备
 - `NativeActivity` 可以被成功拉起
+- 最新版 `200Hz` 持续发送已实机验证有效
 - 之前的若干运行日志里出现过：
   - 中文字体成功加载
   - GUI draw list
   - `First frame, completed`
   - `XR_SESSION_STATE_FOCUSED`
+  - `UDP streaming actual 197.x Hz (target 200 Hz, target 手动目标 (...))`
 
 但要注意：
 
@@ -477,11 +521,20 @@
 - 构建链路是通的
 - 安装链路是通的
 - 启动请求是通的
+- `200Hz` 连续 UDP 发送已不再受渲染帧率限制，实际值约 `197Hz`
 - 但最新这版是否稳定留在前台，需要戴头显再看
 
 ## 当前最可能继续要做的事
 
 ### 优先级 1
+
+继续做实机联调验证：
+
+- 把 `100Hz / 500Hz / 1000Hz` 三档也实测一遍
+- 观察 `1000Hz` 档在目标机器上是否受 CPU / socket / Wi-Fi 限制
+- 确认网络页“实际 Hz”与 `adb logcat` 中的统计是否一致
+
+### 优先级 2
 
 继续优化头显内实际 UI 效果：
 
@@ -489,18 +542,20 @@
 - 某些页面是否仍有重叠
 - 卡片尺寸是否合理
 - 网络页设备列表是否足够清晰
-- 状态 badge 是否足够醒目
-
-### 优先级 2
-
-继续把页面完全做成“工具面板化”：
-
 - 更明显的连接状态
 - 更明显的发送状态
 - 更明显的校准状态
 - 更明显的手势在线/离线状态
 
 ### 优先级 3
+
+如果确认高频 UDP 发送已经稳定，再考虑细化发送链路：
+
+- 是否需要把目标 IP / 端口 / 频率做成更快的 VR 内修改流程
+- 是否需要把 `frame / sequence / data_source / timestamp` 明确写回 JSON
+- 是否需要统计丢包或发送失败次数
+
+### 优先级 4
 
 如果确认旧窗口完全没用了，可以考虑继续清理：
 
@@ -552,6 +607,12 @@ $env:PATH="$env:JAVA_HOME\bin;$env:PATH"
 
 ```powershell
 & 'C:\Users\plf\AppData\Local\Android\Sdk\platform-tools\adb.exe' shell logcat -d -t 500 | Select-String 'ImGuiRenderer loaded font|fallback to default font|GUI debug|First frame, completed|XR_SESSION_STATE_FOCUSED|Fatal signal|Runtime aborting|OpenXRControllerDemo|openxrcontroller' | ForEach-Object { $_.Line }
+```
+
+### 只看 UDP 实际发送频率
+
+```powershell
+& 'C:\Users\plf\AppData\Local\Android\Sdk\platform-tools\adb.exe' shell logcat -d -t 300 | Select-String 'UDP streaming actual|UDP send failed|OpenXRControllerDemo' | ForEach-Object { $_.Line }
 ```
 
 ## 给下一个 Agent 的最短提示词

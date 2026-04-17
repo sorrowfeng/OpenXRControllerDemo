@@ -22,7 +22,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -386,18 +388,24 @@ private:
         bool udp_enabled{false};
         bool scan_in_progress{false};
         bool send_snapshot_requested{false};
+        bool sender_thread_exit{false};
         uint16_t udp_port{9999};
         int send_rate_hz{200};
         int selected_target_index{0};
         int socket_fd{-1};
         uint64_t packet_sequence{0};
         std::chrono::steady_clock::time_point last_send_time{};
+        float actual_send_rate_hz{0.0f};
+        int last_send_bytes{0};
         std::string scan_status{"空闲"};
+        std::string latest_payload;
         LanInterfaceInfo interface_info{};
         std::vector<LanDeviceInfo> discovered_devices{};
         std::string manual_target_ip;
         std::string remembered_target_ip;
         mutable std::mutex device_mutex;
+        std::condition_variable sender_cv;
+        std::thread sender_thread;
         std::thread scan_thread;
     };
 
@@ -426,6 +434,8 @@ private:
     void SetUdpSendingEnabled(bool enabled);
     void ToggleUdpSending();
     void SetDashboardVisible(bool visible);
+    void NotifyUdpSender();
+    void RunUdpSenderLoop();
     void ResetHandZeroPoint(int hand);
     void ResetBothHandsForSending();
     void LoadNetworkPreferences();
@@ -678,6 +688,8 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     bool send_snapshot_requested = false;
     uint16_t udp_port = 0;
     int send_rate_hz = 200;
+    float actual_send_rate_hz = 0.0f;
+    int last_send_bytes = 0;
     uint64_t packet_sequence = 0;
     int selected_target_index = 0;
     std::string scan_status;
@@ -690,6 +702,8 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
         send_snapshot_requested = network_state_.send_snapshot_requested;
         udp_port = network_state_.udp_port;
         send_rate_hz = network_state_.send_rate_hz;
+        actual_send_rate_hz = network_state_.actual_send_rate_hz;
+        last_send_bytes = network_state_.last_send_bytes;
         packet_sequence = network_state_.packet_sequence;
         selected_target_index = network_state_.selected_target_index;
         scan_status = network_state_.scan_status;
@@ -838,7 +852,9 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     draw_status_badge("手追状态", hand_tracking_ready_ ? "就绪" : hand_tracking_create_error_.c_str(),
                       hand_tracking_ready_ ? ImVec4(0.72f, 0.92f, 0.80f, 1.0f) : ImVec4(1.0f, 0.84f, 0.72f, 1.0f), -1.0f);
     ImGui::NextColumn();
-    draw_status_badge("发送状态", udp_enabled ? "持续发送中" : "空闲",
+    const std::string send_badge_text =
+            udp_enabled ? Fmt("持续发送中 %.1f Hz", actual_send_rate_hz) : "空闲";
+    draw_status_badge("发送状态", send_badge_text.c_str(),
                       udp_enabled ? ImVec4(0.72f, 0.88f, 1.0f, 1.0f)
                                   : ImVec4(0.90f, 0.90f, 0.92f, 1.0f),
                       -1.0f);
@@ -887,7 +903,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                               interface_info.local_ip.empty() ? "无" : interface_info.local_ip.c_str(),
                               selected_target.c_str(), static_cast<unsigned int>(udp_port),
                               static_cast<int>(devices.size()),
-                              udp_enabled ? "持续发送中" : "空闲"));
+                              udp_enabled ? Fmt("持续发送中 %.1f Hz", actual_send_rate_hz).c_str() : "空闲"));
         });
         ImGui::Columns(1);
         ImGui::EndChild();
@@ -1060,7 +1076,8 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             ImGui::Separator();
 
             ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "发送频率");
-            ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%d Hz", send_rate_hz);
+            ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "目标 %d Hz | 实际 %.1f Hz", send_rate_hz,
+                               actual_send_rate_hz);
             if (ImGui::Button("1000Hz", ImVec2(78, 38))) SetUdpSendRateHz(1000);
             ImGui::SameLine();
             if (ImGui::Button("500Hz", ImVec2(78, 38))) SetUdpSendRateHz(500);
@@ -1091,6 +1108,10 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "已发包数");
             ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%llu",
                                static_cast<unsigned long long>(packet_sequence));
+            ImGui::Separator();
+
+            ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "最近发送");
+            ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%d 字节", last_send_bytes);
             ImGui::Separator();
 
             // 本机与接口
@@ -1356,6 +1377,7 @@ void ControllerDiagnosticDemo::QueueSingleFrameSend() {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
         network_state_.send_snapshot_requested = true;
     }
+    NotifyUdpSender();
     last_ui_event_ = Fmt("已重置左右手并排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
 }
 
@@ -1365,8 +1387,15 @@ void ControllerDiagnosticDemo::SetUdpSendingEnabled(bool enabled) {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
         if (network_state_.udp_enabled != enabled) {
             network_state_.udp_enabled = enabled;
+            if (!enabled) {
+                network_state_.actual_send_rate_hz = 0.0f;
+            }
             changed = true;
         }
+    }
+
+    if (changed) {
+        NotifyUdpSender();
     }
 
     if (enabled && changed) {
@@ -1396,6 +1425,7 @@ void ControllerDiagnosticDemo::SetUdpSendRateHz(int send_rate_hz) {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
         network_state_.send_rate_hz = send_rate_hz;
     }
+    NotifyUdpSender();
     SaveNetworkPreferences();
     last_ui_event_ = Fmt("UDP 发送频率已设置为 %d Hz", send_rate_hz);
 }
@@ -1404,6 +1434,10 @@ void ControllerDiagnosticDemo::SetDashboardVisible(bool visible) {
     if (dashboard_plane_ != nullptr) {
         dashboard_plane_->SetVisible(visible);
     }
+}
+
+void ControllerDiagnosticDemo::NotifyUdpSender() {
+    network_state_.sender_cv.notify_one();
 }
 
 void ControllerDiagnosticDemo::BeginHandCalibration() {
@@ -1747,12 +1781,18 @@ void ControllerDiagnosticDemo::InitializeNetworkStreaming() {
         network_state_.udp_enabled = false;
         network_state_.scan_in_progress = false;
         network_state_.send_snapshot_requested = false;
+        network_state_.sender_thread_exit = false;
         network_state_.selected_target_index = 0;
         network_state_.last_send_time = std::chrono::steady_clock::time_point{};
+        network_state_.actual_send_rate_hz = 0.0f;
+        network_state_.last_send_bytes = 0;
         network_state_.interface_info = interface_info;
         network_state_.scan_status = scan_status;
+        network_state_.latest_payload.clear();
         network_state_.discovered_devices.clear();
     }
+
+    network_state_.sender_thread = std::thread([this]() { RunUdpSenderLoop(); });
 
     if (interface_info.valid) {
         StartLanScan();
@@ -1760,6 +1800,19 @@ void ControllerDiagnosticDemo::InitializeNetworkStreaming() {
 }
 
 void ControllerDiagnosticDemo::ShutdownNetworkStreaming() {
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        network_state_.sender_thread_exit = true;
+        network_state_.udp_enabled = false;
+        network_state_.send_snapshot_requested = false;
+        network_state_.actual_send_rate_hz = 0.0f;
+    }
+    NotifyUdpSender();
+
+    if (network_state_.sender_thread.joinable()) {
+        network_state_.sender_thread.join();
+    }
+
     if (network_state_.scan_thread.joinable()) {
         network_state_.scan_thread.join();
     }
@@ -1772,6 +1825,9 @@ void ControllerDiagnosticDemo::ShutdownNetworkStreaming() {
         network_state_.udp_enabled = false;
         network_state_.scan_in_progress = false;
         network_state_.send_snapshot_requested = false;
+        network_state_.actual_send_rate_hz = 0.0f;
+        network_state_.last_send_bytes = 0;
+        network_state_.latest_payload.clear();
     }
 
     if (socket_fd >= 0) {
@@ -2169,6 +2225,8 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
     bool scan_in_progress = false;
     uint16_t udp_port = 0;
     int send_rate_hz = 200;
+    float actual_send_rate_hz = 0.0f;
+    int last_send_bytes = 0;
     int selected_target_index = 0;
     uint64_t packet_sequence = 0;
     std::string scan_status;
@@ -2180,6 +2238,8 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
         scan_in_progress = network_state_.scan_in_progress;
         udp_port = network_state_.udp_port;
         send_rate_hz = network_state_.send_rate_hz;
+        actual_send_rate_hz = network_state_.actual_send_rate_hz;
+        last_send_bytes = network_state_.last_send_bytes;
         selected_target_index = network_state_.selected_target_index;
         packet_sequence = network_state_.packet_sequence;
         scan_status = network_state_.scan_status;
@@ -2201,10 +2261,12 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
            << "\n";
     stream << "广播地址  " << (interface_info.valid ? interface_info.broadcast_ip : "无") << "\n";
     stream << "端口  " << udp_port << "\n";
-    stream << "频率  " << send_rate_hz << " Hz\n";
+    stream << "频率  目标 " << send_rate_hz << " Hz / 实际 " << std::fixed << std::setprecision(1)
+           << actual_send_rate_hz << " Hz\n";
     stream << "目标  " << selected_target << "\n";
     stream << "扫描状态  " << (scan_in_progress ? "扫描中" : scan_status) << "\n";
     stream << "已发包  " << packet_sequence << "\n";
+    stream << "最近发送  " << last_send_bytes << " 字节\n";
     stream << "发现设备  " << devices.size() << "\n";
     if (!devices.empty()) {
         stream << "设备列表\n";
@@ -2221,61 +2283,158 @@ void ControllerDiagnosticDemo::UpdateNetworkStreaming() {
         return;
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    uint64_t sequence_to_send = 0;
-    bool should_send = false;
-    int send_rate_hz = 200;
+    const std::string payload = BuildUdpPayloadJson(0);
+    bool should_notify = false;
     {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
         if (!network_state_.interface_info.valid) {
+            network_state_.latest_payload.clear();
             return;
         }
+        network_state_.latest_payload = payload;
+        should_notify = network_state_.udp_enabled || network_state_.send_snapshot_requested;
+    }
 
-        send_rate_hz = network_state_.send_rate_hz;
-        const int send_interval_ms = std::max(1, 1000 / std::max(1, send_rate_hz));
-        const bool send_due = network_state_.udp_enabled &&
-                              (network_state_.packet_sequence == 0 ||
-                               now - network_state_.last_send_time >= std::chrono::milliseconds(send_interval_ms));
-        if (network_state_.send_snapshot_requested || send_due) {
-            network_state_.send_snapshot_requested = false;
+    if (should_notify) {
+        NotifyUdpSender();
+    }
+}
+
+void ControllerDiagnosticDemo::RunUdpSenderLoop() {
+    auto next_send_time = std::chrono::steady_clock::now();
+    auto stats_window_start = next_send_time;
+    uint64_t stats_window_packets = 0;
+
+    while (true) {
+        sockaddr_in target_addr{};
+        std::string payload;
+        std::string target_label;
+        int socket_fd = -1;
+        int send_rate_hz = 200;
+        bool send_snapshot = false;
+
+        {
+            std::unique_lock<std::mutex> lock(network_state_.device_mutex);
+            network_state_.sender_cv.wait(lock, [this]() {
+                return network_state_.sender_thread_exit ||
+                       network_state_.send_snapshot_requested ||
+                       (network_state_.udp_enabled && !network_state_.latest_payload.empty() &&
+                        network_state_.interface_info.valid && network_state_.socket_fd >= 0);
+            });
+
+            if (network_state_.sender_thread_exit) {
+                break;
+            }
+
+            send_rate_hz = std::max(1, network_state_.send_rate_hz);
+            const auto send_interval = std::chrono::microseconds(1000000 / send_rate_hz);
+            const auto now = std::chrono::steady_clock::now();
+            const bool continuous_ready = network_state_.udp_enabled &&
+                                          !network_state_.latest_payload.empty() &&
+                                          network_state_.interface_info.valid &&
+                                          network_state_.socket_fd >= 0;
+
+            if (!network_state_.send_snapshot_requested && continuous_ready && now < next_send_time) {
+                network_state_.sender_cv.wait_until(lock, next_send_time, [this]() {
+                    return network_state_.sender_thread_exit || network_state_.send_snapshot_requested;
+                });
+                continue;
+            }
+
+            if (network_state_.sender_thread_exit) {
+                break;
+            }
+
+            send_snapshot = network_state_.send_snapshot_requested;
+            if (!send_snapshot && !continuous_ready) {
+                continue;
+            }
+
+            socket_fd = network_state_.socket_fd;
+            payload = network_state_.latest_payload;
+            if (payload.empty()) {
+                lock.unlock();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+
+            std::memset(&target_addr, 0, sizeof(target_addr));
+            target_addr.sin_family = AF_INET;
+            target_addr.sin_port = htons(network_state_.udp_port);
+
+            bool target_valid = false;
+            if (network_state_.selected_target_index <= 0 ||
+                network_state_.selected_target_index > static_cast<int>(network_state_.discovered_devices.size())) {
+                if (!network_state_.manual_target_ip.empty()) {
+                    target_valid = inet_pton(AF_INET, network_state_.manual_target_ip.c_str(), &target_addr.sin_addr) == 1;
+                    target_label = Fmt("手动目标 (%s)", network_state_.manual_target_ip.c_str());
+                } else {
+                    target_addr.sin_addr.s_addr = htonl(network_state_.interface_info.broadcast_ip_host);
+                    target_valid = true;
+                    target_label = Fmt("广播 (%s)", network_state_.interface_info.broadcast_ip.c_str());
+                }
+            } else {
+                const auto& device = network_state_.discovered_devices[network_state_.selected_target_index - 1];
+                target_valid = inet_pton(AF_INET, device.ip.c_str(), &target_addr.sin_addr) == 1;
+                target_label = Fmt("%s (%s)", device.ip.c_str(), device.mac.c_str());
+            }
+
+            if (!target_valid) {
+                network_state_.send_snapshot_requested = false;
+                network_state_.scan_status = "目标地址解析失败";
+                continue;
+            }
+
+            ++network_state_.packet_sequence;
             network_state_.last_send_time = now;
-            sequence_to_send = ++network_state_.packet_sequence;
-            should_send = true;
+            network_state_.send_snapshot_requested = false;
+            if (network_state_.udp_enabled) {
+                next_send_time = now + send_interval;
+            } else {
+                next_send_time = now;
+            }
+        }
+
+        const int send_result = sendto(socket_fd, payload.c_str(), static_cast<int>(payload.size()), 0,
+                                       reinterpret_cast<const sockaddr*>(&target_addr), sizeof(target_addr));
+        const auto now = std::chrono::steady_clock::now();
+
+        if (send_result >= 0) {
+            ++stats_window_packets;
+        }
+
+        float actual_send_rate_hz = 0.0f;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - stats_window_start);
+        if (elapsed.count() >= 1000) {
+            const double seconds = static_cast<double>(elapsed.count()) / 1000.0;
+            actual_send_rate_hz = seconds > 0.0 ? static_cast<float>(stats_window_packets / seconds) : 0.0f;
+            stats_window_start = now;
+            stats_window_packets = 0;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+            network_state_.last_send_bytes = std::max(send_result, 0);
+            if (send_result >= 0) {
+                network_state_.scan_status = Fmt("最近一次 UDP 发送成功，%d 字节", send_result);
+            } else {
+                network_state_.scan_status = Fmt("UDP 发送失败 (%d)", errno);
+            }
+            if (actual_send_rate_hz > 0.0f) {
+                network_state_.actual_send_rate_hz = actual_send_rate_hz;
+            }
+        }
+
+        if (actual_send_rate_hz > 0.0f) {
+            __android_log_print(ANDROID_LOG_INFO, "OpenXRControllerDemo",
+                                "UDP streaming actual %.1f Hz (target %d Hz, target %s)",
+                                actual_send_rate_hz, send_rate_hz, target_label.c_str());
+        } else if (send_result < 0) {
+            __android_log_print(ANDROID_LOG_WARN, "OpenXRControllerDemo",
+                                "UDP send failed to %s with errno=%d",
+                                target_label.c_str(), errno);
         }
     }
-
-    if (!should_send) {
-        return;
-    }
-
-    sockaddr_in target_addr{};
-    if (!ResolveSelectedTarget(&target_addr)) {
-        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-        network_state_.scan_status = "目标地址解析失败";
-        return;
-    }
-
-    const std::string payload = BuildUdpPayloadJson(sequence_to_send);
-    const char* target_ip = inet_ntoa(target_addr.sin_addr);
-    const int target_port = ntohs(target_addr.sin_port);
-    __android_log_print(ANDROID_LOG_INFO, "OpenXRControllerDemo",
-                        "UDP send to %s:%d | payload=%s%s",
-                        target_ip ? target_ip : "?", target_port,
-                        payload.substr(0, 160).c_str(),
-                        payload.size() > 160 ? "..." : "");
-
-    const int send_result =
-            sendto(network_state_.socket_fd, payload.c_str(), static_cast<int>(payload.size()), 0,
-                   reinterpret_cast<const sockaddr*>(&target_addr), sizeof(target_addr));
-    {
-        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-        network_state_.scan_status =
-                send_result >= 0
-                        ? Fmt("%s，%d 字节", "最近一次 UDP 发送成功", send_result)
-                        : "UDP 发送失败";
-    }
-    __android_log_print(ANDROID_LOG_INFO, "OpenXRControllerDemo",
-                        "UDP send result: %d (errno hint)", send_result);
 }
 
 bool ControllerDiagnosticDemo::InitializeHandTracking() {
