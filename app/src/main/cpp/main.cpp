@@ -395,6 +395,7 @@ private:
         LanInterfaceInfo interface_info{};
         std::vector<LanDeviceInfo> discovered_devices{};
         std::string manual_target_ip;
+        std::string remembered_target_ip;
         mutable std::mutex device_mutex;
         std::thread scan_thread;
     };
@@ -419,6 +420,15 @@ private:
     void DetectInputEvents();
     void StartLanScan();
     void AdvanceSelectedLanTarget(int delta);
+    void ApplyManualTargetIp(const std::string& ip);
+    void QueueSingleFrameSend();
+    void SetUdpSendingEnabled(bool enabled);
+    void ToggleUdpSending();
+    void ResetHandZeroPoint(int hand);
+    void ResetBothHandsForSending();
+    void LoadNetworkPreferences();
+    void SaveNetworkPreferences() const;
+    std::string GetNetworkPreferencesPath() const;
 
     std::string BuildControllerText(int hand) const;
     std::string BuildHandText(int hand) const;
@@ -690,8 +700,9 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     static char manual_ip_buffer[64] = {};
     {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-        if (!network_state_.manual_target_ip.empty() && std::strcmp(manual_ip_buffer, network_state_.manual_target_ip.c_str()) != 0) {
-            std::strncpy(manual_ip_buffer, network_state_.manual_target_ip.c_str(), sizeof(manual_ip_buffer) - 1);
+        const char* current_manual_target = network_state_.manual_target_ip.c_str();
+        if (std::strcmp(manual_ip_buffer, current_manual_target) != 0) {
+            std::strncpy(manual_ip_buffer, current_manual_target, sizeof(manual_ip_buffer) - 1);
             manual_ip_buffer[sizeof(manual_ip_buffer) - 1] = '\0';
         }
     }
@@ -944,16 +955,11 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                 }
                 sockaddr_in test_addr{};
                 if (!entered.empty() && inet_pton(AF_INET, entered.c_str(), &test_addr.sin_addr) == 1) {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.manual_target_ip = entered;
-                    network_state_.selected_target_index = 0;
-                    last_ui_event_ = Fmt("已设置手动目标 %s", entered.c_str());
+                    ApplyManualTargetIp(entered);
                 } else if (!entered.empty()) {
                     last_ui_event_ = "手动 IP 格式无效";
                 } else {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.manual_target_ip.clear();
-                    last_ui_event_ = "已清除手动目标，恢复广播";
+                    ApplyManualTargetIp("");
                 }
             }
             // 手柄友好的快速 IP 调整（无需键盘输入）
@@ -996,10 +1002,9 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                     octets[edit_octet] += delta;
                     if (octets[edit_octet] < 0) octets[edit_octet] = 0;
                     if (octets[edit_octet] > 255) octets[edit_octet] = 255;
-                    network_state_.manual_target_ip = Fmt("%d.%d.%d.%d", octets[0], octets[1], octets[2], octets[3]);
-                    network_state_.selected_target_index = 0;
-                    last_ui_event_ = Fmt("已调整手动目标为 %s", network_state_.manual_target_ip.c_str());
-                    std::strncpy(manual_ip_buffer, network_state_.manual_target_ip.c_str(), sizeof(manual_ip_buffer) - 1);
+                    const std::string adjusted_ip = Fmt("%d.%d.%d.%d", octets[0], octets[1], octets[2], octets[3]);
+                    ApplyManualTargetIp(adjusted_ip);
+                    std::strncpy(manual_ip_buffer, adjusted_ip.c_str(), sizeof(manual_ip_buffer) - 1);
                     manual_ip_buffer[sizeof(manual_ip_buffer) - 1] = '\0';
                 };
                 auto switch_octet = [&](int delta) {
@@ -1112,13 +1117,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             ImGui::NextColumn();
             draw_controller_actions();
             ImGui::NextColumn();
-            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() {
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.send_snapshot_requested = true;
-                }
-                last_ui_event_ = Fmt("已排队发送一帧到 %s", selected_target.c_str());
-            });
+            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() { QueueSingleFrameSend(); });
             ImGui::NextColumn();
             draw_action_button(udp_data_source_ == UdpDataSource::HAND ? "切手柄源" : "切手势源",
                                ImVec4(0.88f, 0.80f, 0.96f, 1.0f), [&]() {
@@ -1138,13 +1137,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             ImGui::NextColumn();
             draw_action_button("开始校准", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { BeginHandCalibration(); });
             ImGui::NextColumn();
-            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() {
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.send_snapshot_requested = true;
-                }
-                last_ui_event_ = Fmt("已排队发送一帧到 %s", selected_target.c_str());
-            });
+            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() { QueueSingleFrameSend(); });
             break;
         case DashboardSection::Hand:
             draw_action_button("开始校准", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { BeginHandCalibration(); });
@@ -1164,23 +1157,9 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             ImGui::NextColumn();
             draw_action_button("下个目标", ImVec4(0.84f, 0.88f, 0.93f, 1.0f), [&]() { AdvanceSelectedLanTarget(1); });
             ImGui::NextColumn();
-            draw_action_button("UDP 开关", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() {
-                bool enabled = false;
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.udp_enabled = !network_state_.udp_enabled;
-                    enabled = network_state_.udp_enabled;
-                }
-                last_ui_event_ = Fmt("UDP 推流已%s", enabled ? "开启" : "关闭");
-            });
+            draw_action_button("UDP 开关", ImVec4(0.18f, 0.72f, 0.52f, 1.0f), [&]() { ToggleUdpSending(); });
             ImGui::NextColumn();
-            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() {
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.send_snapshot_requested = true;
-                }
-                last_ui_event_ = Fmt("已排队发送一帧到 %s", selected_target.c_str());
-            });
+            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() { QueueSingleFrameSend(); });
             ImGui::NextColumn();
             draw_action_button(udp_data_source_ == UdpDataSource::HAND ? "切手柄源" : "切手势源",
                                ImVec4(0.88f, 0.80f, 0.96f, 1.0f), [&]() {
@@ -1200,23 +1179,9 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             ImGui::NextColumn();
             draw_action_button("扫描局域网", ImVec4(0.16f, 0.66f, 0.86f, 1.0f), [&]() { StartLanScan(); });
             ImGui::NextColumn();
-            draw_action_button("UDP 开关", ImVec4(0.22f, 0.56f, 0.96f, 1.0f), [&]() {
-                bool enabled = false;
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.udp_enabled = !network_state_.udp_enabled;
-                    enabled = network_state_.udp_enabled;
-                }
-                last_ui_event_ = Fmt("UDP 推流已%s", enabled ? "开启" : "关闭");
-            });
+            draw_action_button("UDP 开关", ImVec4(0.22f, 0.56f, 0.96f, 1.0f), [&]() { ToggleUdpSending(); });
             ImGui::NextColumn();
-            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() {
-                {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    network_state_.send_snapshot_requested = true;
-                }
-                last_ui_event_ = Fmt("已排队发送一帧到 %s", selected_target.c_str());
-            });
+            draw_action_button("发送一帧", ImVec4(0.96f, 0.68f, 0.20f, 1.0f), [&]() { QueueSingleFrameSend(); });
             break;
     }
     ImGui::Columns(1);
@@ -1246,6 +1211,149 @@ void ControllerDiagnosticDemo::SetDashboardSection(DashboardSection section) {
             last_ui_event_ = "已切换到映射页";
             break;
     }
+}
+
+std::string ControllerDiagnosticDemo::GetNetworkPreferencesPath() const {
+    const std::string base_path = GetInternalDataPath();
+    if (base_path.empty()) {
+        return "network_prefs.txt";
+    }
+    return base_path + "/network_prefs.txt";
+}
+
+void ControllerDiagnosticDemo::LoadNetworkPreferences() {
+    std::ifstream input(GetNetworkPreferencesPath());
+    if (!input.is_open()) {
+        return;
+    }
+
+    std::string line;
+    std::string manual_ip;
+    std::string remembered_ip;
+    uint16_t udp_port = network_state_.udp_port;
+    while (std::getline(input, line)) {
+        const size_t separator = line.find('=');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        const std::string key = line.substr(0, separator);
+        const std::string value = line.substr(separator + 1);
+        if (key == "manual_target_ip") {
+            manual_ip = value;
+        } else if (key == "remembered_target_ip") {
+            remembered_ip = value;
+        } else if (key == "udp_port") {
+            const int parsed_port = std::atoi(value.c_str());
+            if (parsed_port >= 1024 && parsed_port <= 65535) {
+                udp_port = static_cast<uint16_t>(parsed_port);
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+    network_state_.manual_target_ip = manual_ip;
+    network_state_.remembered_target_ip = remembered_ip;
+    network_state_.udp_port = udp_port;
+}
+
+void ControllerDiagnosticDemo::SaveNetworkPreferences() const {
+    std::string manual_target_ip;
+    std::string remembered_target_ip;
+    uint16_t udp_port = 0;
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        manual_target_ip = network_state_.manual_target_ip;
+        remembered_target_ip = network_state_.remembered_target_ip;
+        udp_port = network_state_.udp_port;
+    }
+
+    std::ofstream output(GetNetworkPreferencesPath(), std::ios::trunc);
+    if (!output.is_open()) {
+        __android_log_print(ANDROID_LOG_WARN, "OpenXRControllerDemo",
+                            "Failed to save network preferences to %s", GetNetworkPreferencesPath().c_str());
+        return;
+    }
+
+    output << "manual_target_ip=" << manual_target_ip << "\n";
+    output << "remembered_target_ip=" << remembered_target_ip << "\n";
+    output << "udp_port=" << static_cast<unsigned int>(udp_port) << "\n";
+}
+
+void ControllerDiagnosticDemo::ApplyManualTargetIp(const std::string& ip) {
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        network_state_.manual_target_ip = ip;
+        network_state_.selected_target_index = 0;
+        network_state_.remembered_target_ip = ip;
+    }
+    SaveNetworkPreferences();
+    last_ui_event_ = ip.empty() ? "已清除手动目标，恢复广播" : Fmt("已设置手动目标 %s", ip.c_str());
+}
+
+void ControllerDiagnosticDemo::ResetHandZeroPoint(int hand) {
+    if (hand < 0 || hand >= Side::COUNT) {
+        return;
+    }
+
+    const RobotHandMetrics raw_metrics = ComputeRobotHandMetrics(hand);
+    if (raw_metrics.valid) {
+        auto& calibration = hand_calibration_states_[hand];
+        calibration.pending = false;
+        calibration.countdown_started = false;
+        calibration.calibrated = true;
+        calibration.controller_fallback = !hand_states_[hand].active;
+        calibration.zero_metrics = raw_metrics;
+        calibration.status = hand_states_[hand].active ? "已重置零位" : "已用握把重置零位";
+        last_ui_event_ = Fmt("%s已重置当前位置为零点", hand == Side::LEFT ? "左手" : "右手");
+        return;
+    }
+
+    if (current_frame_in_.controller_actives[hand] == XR_TRUE) {
+        CalibrateControllerFallbackZero(hand);
+        return;
+    }
+
+    last_ui_event_ = Fmt("%s当前未在线，无法重置零点", hand == Side::LEFT ? "左手" : "右手");
+}
+
+void ControllerDiagnosticDemo::ResetBothHandsForSending() {
+    ResetHandZeroPoint(Side::LEFT);
+    ResetHandZeroPoint(Side::RIGHT);
+}
+
+void ControllerDiagnosticDemo::QueueSingleFrameSend() {
+    ResetBothHandsForSending();
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        network_state_.send_snapshot_requested = true;
+    }
+    last_ui_event_ = Fmt("已重置左右手并排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
+}
+
+void ControllerDiagnosticDemo::SetUdpSendingEnabled(bool enabled) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        if (network_state_.udp_enabled != enabled) {
+            network_state_.udp_enabled = enabled;
+            changed = true;
+        }
+    }
+
+    if (enabled && changed) {
+        ResetBothHandsForSending();
+        last_ui_event_ = Fmt("UDP 发送已开启，并已重置左右手到当前零点");
+    } else if (!enabled && changed) {
+        last_ui_event_ = "UDP 发送已停止";
+    }
+}
+
+void ControllerDiagnosticDemo::ToggleUdpSending() {
+    const bool next_enabled = [this]() {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        return !network_state_.udp_enabled;
+    }();
+    SetUdpSendingEnabled(next_enabled);
 }
 
 void ControllerDiagnosticDemo::BeginHandCalibration() {
@@ -1527,15 +1635,13 @@ void ControllerDiagnosticDemo::AddNetworkPanel() {
     network_window_->SetComponentBgColor(next_button, 0.16f, 0.32f, 0.56f, 1.0f);
 
     const int toggle_button = network_window_->AddButton("UDP 开关", 496, 142, [&]() {
-        network_state_.udp_enabled = !network_state_.udp_enabled;
-        last_ui_event_ = Fmt("UDP 推流已%s", network_state_.udp_enabled ? "开启" : "关闭");
+        ToggleUdpSending();
     });
     network_window_->SetComponentSize(toggle_button, 142, 46);
     network_window_->SetComponentBgColor(toggle_button, 0.02f, 0.62f, 0.44f, 1.0f);
 
     const int send_once_button = network_window_->AddButton("发送一帧", 24, 204, [&]() {
-        network_state_.send_snapshot_requested = true;
-        last_ui_event_ = Fmt("已排队发送一帧到 %s", BuildSelectedTargetLabel().c_str());
+        QueueSingleFrameSend();
     });
     network_window_->SetComponentSize(send_once_button, 132, 44);
     network_window_->SetComponentBgColor(send_once_button, 0.60f, 0.38f, 0.02f, 1.0f);
@@ -1543,6 +1649,7 @@ void ControllerDiagnosticDemo::AddNetworkPanel() {
     const int port_down_button = network_window_->AddButton("端口 -", 176, 204, [&]() {
         if (network_state_.udp_port > 1024) {
             --network_state_.udp_port;
+            SaveNetworkPreferences();
             last_ui_event_ = Fmt("UDP 端口已设为 %u", static_cast<unsigned int>(network_state_.udp_port));
         }
     });
@@ -1552,6 +1659,7 @@ void ControllerDiagnosticDemo::AddNetworkPanel() {
     const int port_up_button = network_window_->AddButton("端口 +", 292, 204, [&]() {
         if (network_state_.udp_port < 65535) {
             ++network_state_.udp_port;
+            SaveNetworkPreferences();
             last_ui_event_ = Fmt("UDP 端口已设为 %u", static_cast<unsigned int>(network_state_.udp_port));
         }
     });
@@ -1569,6 +1677,7 @@ void ControllerDiagnosticDemo::AddNetworkPanel() {
 
 void ControllerDiagnosticDemo::InitializeNetworkStreaming() {
     ShutdownNetworkStreaming();
+    LoadNetworkPreferences();
 
     const LanInterfaceInfo interface_info = QueryLanInterface();
     std::string scan_status = interface_info.valid ? "接口就绪" : "未找到可用 IPv4 局域网接口";
@@ -1663,9 +1772,25 @@ void ControllerDiagnosticDemo::StartLanScan() {
             network_state_.scan_status =
                     Fmt("扫描完成：%d 台设备，接口 %s", static_cast<int>(devices.size()),
                         interface_info.interface_name.c_str());
-            const int max_index = static_cast<int>(devices.size());
-            network_state_.selected_target_index = std::clamp(network_state_.selected_target_index, 0, max_index);
+            if (!network_state_.manual_target_ip.empty()) {
+                network_state_.selected_target_index = 0;
+            } else if (!network_state_.remembered_target_ip.empty()) {
+                const auto remembered = std::find_if(
+                        devices.begin(), devices.end(), [&](const LanDeviceInfo& device) {
+                            return device.ip == network_state_.remembered_target_ip;
+                        });
+                if (remembered != devices.end()) {
+                    network_state_.selected_target_index =
+                            static_cast<int>(std::distance(devices.begin(), remembered)) + 1;
+                } else {
+                    network_state_.selected_target_index = 0;
+                }
+            } else {
+                const int max_index = static_cast<int>(devices.size());
+                network_state_.selected_target_index = std::clamp(network_state_.selected_target_index, 0, max_index);
+            }
         }
+        SaveNetworkPreferences();
     });
 }
 
@@ -1683,7 +1808,15 @@ void ControllerDiagnosticDemo::AdvanceSelectedLanTarget(int delta) {
             next_index %= total_targets;
             network_state_.selected_target_index = next_index;
         }
+        if (network_state_.selected_target_index <= 0 ||
+            network_state_.selected_target_index > static_cast<int>(network_state_.discovered_devices.size())) {
+            network_state_.remembered_target_ip = network_state_.manual_target_ip;
+        } else {
+            network_state_.remembered_target_ip =
+                    network_state_.discovered_devices[network_state_.selected_target_index - 1].ip;
+        }
     }
+    SaveNetworkPreferences();
     last_ui_event_ = Fmt("UDP 目标已切换到 %s", BuildSelectedTargetLabel().c_str());
 }
 
@@ -2358,9 +2491,7 @@ void ControllerDiagnosticDemo::DetectInputEvents() {
     const auto now = std::chrono::steady_clock::now();
 
     auto toggle_udp = [this]() {
-        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-        network_state_.udp_enabled = !network_state_.udp_enabled;
-        last_ui_event_ = network_state_.udp_enabled ? "UDP 发送已开启" : "UDP 发送已停止";
+        ToggleUdpSending();
     };
 
     // X key (left controller): short press toggles UDP, long press calibrates left hand
@@ -2379,9 +2510,7 @@ void ControllerDiagnosticDemo::DetectInputEvents() {
     if ((buttons & kButtonX) != 0 && !x_long_triggered_) {
         if (now - x_press_time_ >= kLongPressThreshold) {
             x_long_triggered_ = true;
-            if (current_frame_in_.controller_actives[Side::LEFT] == XR_TRUE) {
-                CalibrateControllerFallbackZero(Side::LEFT);
-            }
+            ResetHandZeroPoint(Side::LEFT);
         }
     }
 
@@ -2401,9 +2530,7 @@ void ControllerDiagnosticDemo::DetectInputEvents() {
     if ((buttons & kButtonA) != 0 && !a_long_triggered_) {
         if (now - a_press_time_ >= kLongPressThreshold) {
             a_long_triggered_ = true;
-            if (current_frame_in_.controller_actives[Side::RIGHT] == XR_TRUE) {
-                CalibrateControllerFallbackZero(Side::RIGHT);
-            }
+            ResetHandZeroPoint(Side::RIGHT);
         }
     }
 
@@ -2503,6 +2630,7 @@ ControllerDiagnosticDemo::RobotHandMetrics ControllerDiagnosticDemo::ComputeRobo
             metrics.valid = true;
             metrics.spatial_valid = true;
             metrics.palm_position = current_frame_in_.controller_poses[hand].position;
+            metrics.palm_orientation = current_frame_in_.controller_poses[hand].orientation;
         }
         return metrics;
     }
@@ -2512,6 +2640,7 @@ ControllerDiagnosticDemo::RobotHandMetrics ControllerDiagnosticDemo::ComputeRobo
     if (IsJointPoseValid(joints, XR_HAND_JOINT_PALM_EXT)) {
         metrics.spatial_valid = true;
         metrics.palm_position = joints[XR_HAND_JOINT_PALM_EXT].pose.position;
+        metrics.palm_orientation = joints[XR_HAND_JOINT_PALM_EXT].pose.orientation;
     }
     if (IsJointPoseValid(joints, XR_HAND_JOINT_INDEX_TIP_EXT)) {
         metrics.index_tip_position = joints[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position;
