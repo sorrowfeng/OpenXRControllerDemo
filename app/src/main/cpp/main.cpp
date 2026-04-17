@@ -387,6 +387,7 @@ private:
         bool scan_in_progress{false};
         bool send_snapshot_requested{false};
         uint16_t udp_port{9999};
+        int send_rate_hz{200};
         int selected_target_index{0};
         int socket_fd{-1};
         uint64_t packet_sequence{0};
@@ -424,11 +425,13 @@ private:
     void QueueSingleFrameSend();
     void SetUdpSendingEnabled(bool enabled);
     void ToggleUdpSending();
+    void SetDashboardVisible(bool visible);
     void ResetHandZeroPoint(int hand);
     void ResetBothHandsForSending();
     void LoadNetworkPreferences();
     void SaveNetworkPreferences() const;
     std::string GetNetworkPreferencesPath() const;
+    void SetUdpSendRateHz(int send_rate_hz);
 
     std::string BuildControllerText(int hand) const;
     std::string BuildHandText(int hand) const;
@@ -674,6 +677,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     bool scan_in_progress = false;
     bool send_snapshot_requested = false;
     uint16_t udp_port = 0;
+    int send_rate_hz = 200;
     uint64_t packet_sequence = 0;
     int selected_target_index = 0;
     std::string scan_status;
@@ -685,6 +689,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
         scan_in_progress = network_state_.scan_in_progress;
         send_snapshot_requested = network_state_.send_snapshot_requested;
         udp_port = network_state_.udp_port;
+        send_rate_hz = network_state_.send_rate_hz;
         packet_sequence = network_state_.packet_sequence;
         selected_target_index = network_state_.selected_target_index;
         scan_status = network_state_.scan_status;
@@ -817,7 +822,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
     ImGui::TextWrapped("按住扳机键并移动控制器，可拖动窗口位置。");
     ImGui::Spacing();
     draw_status_badge("快捷按键", "X / A", ImVec4(0.96f, 0.96f, 0.97f, 1.0f), -1.0f);
-    ImGui::TextWrapped("短按 X/A 键：切换 UDP 发送开关。长按 X 键：左手重置零点。长按 A 键：右手重置零点。");
+    ImGui::TextWrapped("点按 A：未发送时开启发送并隐藏窗口，发送中时停止发送并显示窗口。长按 A：同时重置左右手零点。");
     ImGui::EndChild();
 
     ImGui::SameLine();
@@ -853,7 +858,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
 
     if (dashboard_section_ == DashboardSection::Overview) {
         ImGui::BeginChild("overview_grid", ImVec2(0, -170.0f), false);
-        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：长按 X 左手重置 / 长按 A 右手重置  |  短按 X/A 开关 UDP  |  扳机键可拖动窗口");
+        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：点按 A 切换发送并联动显隐窗口 | 长按 A 同时重置左右手");
         ImGui::Columns(3, "overview_cols", false);
         draw_card("运行总览", ImVec2(0, 300.0f), [&]() {
             draw_big_text(Fmt("当前帧  %lld\n预测显示  %.3f 秒\n在线手柄  %d / 2\n在线手部  %d / 2\n"
@@ -888,7 +893,7 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
         ImGui::EndChild();
     } else if (dashboard_section_ == DashboardSection::Controller) {
         ImGui::BeginChild("controller_grid", ImVec2(0, -170.0f), false);
-        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：长按 X/A 重置对应手柄零点后，本页显示为相对位置与角度");
+        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1.0f), "提示：点按 A 切换发送并联动显示窗口；长按 A 同时重置左右手");
         ImGui::Columns(3, "controller_cols", false);
         draw_card("左手柄", ImVec2(0, 420.0f), [&]() { draw_big_text(BuildControllerText(Side::LEFT)); });
         ImGui::NextColumn();
@@ -987,8 +992,11 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
                     return base_ip;
                 }();
                 auto apply_delta = [&](int delta) {
-                    std::lock_guard<std::mutex> lock(network_state_.device_mutex);
-                    std::string base_ip = network_state_.manual_target_ip;
+                    std::string base_ip;
+                    {
+                        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+                        base_ip = network_state_.manual_target_ip;
+                    }
                     if (base_ip.empty() && interface_info.valid) {
                         std::string local = interface_info.local_ip;
                         size_t last_dot = local.rfind('.');
@@ -1049,6 +1057,17 @@ void ControllerDiagnosticDemo::DrawDashboardImGui() {
             // 端口
             ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "UDP 端口");
             ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%u", static_cast<unsigned int>(udp_port));
+            ImGui::Separator();
+
+            ImGui::TextColored(ImVec4(0.16f, 0.26f, 0.40f, 1.0f), "发送频率");
+            ImGui::TextColored(ImVec4(0.10f, 0.45f, 0.82f, 1.0f), "%d Hz", send_rate_hz);
+            if (ImGui::Button("1000Hz", ImVec2(78, 38))) SetUdpSendRateHz(1000);
+            ImGui::SameLine();
+            if (ImGui::Button("500Hz", ImVec2(78, 38))) SetUdpSendRateHz(500);
+            ImGui::SameLine();
+            if (ImGui::Button("200Hz", ImVec2(78, 38))) SetUdpSendRateHz(200);
+            ImGui::SameLine();
+            if (ImGui::Button("100Hz", ImVec2(78, 38))) SetUdpSendRateHz(100);
             ImGui::Separator();
 
             // 发送状态（大且醒目）
@@ -1231,6 +1250,7 @@ void ControllerDiagnosticDemo::LoadNetworkPreferences() {
     std::string manual_ip;
     std::string remembered_ip;
     uint16_t udp_port = network_state_.udp_port;
+    int send_rate_hz = network_state_.send_rate_hz;
     while (std::getline(input, line)) {
         const size_t separator = line.find('=');
         if (separator == std::string::npos) {
@@ -1247,6 +1267,11 @@ void ControllerDiagnosticDemo::LoadNetworkPreferences() {
             if (parsed_port >= 1024 && parsed_port <= 65535) {
                 udp_port = static_cast<uint16_t>(parsed_port);
             }
+        } else if (key == "send_rate_hz") {
+            const int parsed_rate = std::atoi(value.c_str());
+            if (parsed_rate == 100 || parsed_rate == 200 || parsed_rate == 500 || parsed_rate == 1000) {
+                send_rate_hz = parsed_rate;
+            }
         }
     }
 
@@ -1254,17 +1279,20 @@ void ControllerDiagnosticDemo::LoadNetworkPreferences() {
     network_state_.manual_target_ip = manual_ip;
     network_state_.remembered_target_ip = remembered_ip;
     network_state_.udp_port = udp_port;
+    network_state_.send_rate_hz = send_rate_hz;
 }
 
 void ControllerDiagnosticDemo::SaveNetworkPreferences() const {
     std::string manual_target_ip;
     std::string remembered_target_ip;
     uint16_t udp_port = 0;
+    int send_rate_hz = 200;
     {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
         manual_target_ip = network_state_.manual_target_ip;
         remembered_target_ip = network_state_.remembered_target_ip;
         udp_port = network_state_.udp_port;
+        send_rate_hz = network_state_.send_rate_hz;
     }
 
     std::ofstream output(GetNetworkPreferencesPath(), std::ios::trunc);
@@ -1277,6 +1305,7 @@ void ControllerDiagnosticDemo::SaveNetworkPreferences() const {
     output << "manual_target_ip=" << manual_target_ip << "\n";
     output << "remembered_target_ip=" << remembered_target_ip << "\n";
     output << "udp_port=" << static_cast<unsigned int>(udp_port) << "\n";
+    output << "send_rate_hz=" << send_rate_hz << "\n";
 }
 
 void ControllerDiagnosticDemo::ApplyManualTargetIp(const std::string& ip) {
@@ -1342,8 +1371,10 @@ void ControllerDiagnosticDemo::SetUdpSendingEnabled(bool enabled) {
 
     if (enabled && changed) {
         ResetBothHandsForSending();
+        SetDashboardVisible(false);
         last_ui_event_ = Fmt("UDP 发送已开启，并已重置左右手到当前零点");
     } else if (!enabled && changed) {
+        SetDashboardVisible(true);
         last_ui_event_ = "UDP 发送已停止";
     }
 }
@@ -1354,6 +1385,25 @@ void ControllerDiagnosticDemo::ToggleUdpSending() {
         return !network_state_.udp_enabled;
     }();
     SetUdpSendingEnabled(next_enabled);
+}
+
+void ControllerDiagnosticDemo::SetUdpSendRateHz(int send_rate_hz) {
+    if (send_rate_hz != 100 && send_rate_hz != 200 && send_rate_hz != 500 && send_rate_hz != 1000) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(network_state_.device_mutex);
+        network_state_.send_rate_hz = send_rate_hz;
+    }
+    SaveNetworkPreferences();
+    last_ui_event_ = Fmt("UDP 发送频率已设置为 %d Hz", send_rate_hz);
+}
+
+void ControllerDiagnosticDemo::SetDashboardVisible(bool visible) {
+    if (dashboard_plane_ != nullptr) {
+        dashboard_plane_->SetVisible(visible);
+    }
 }
 
 void ControllerDiagnosticDemo::BeginHandCalibration() {
@@ -1678,6 +1728,7 @@ void ControllerDiagnosticDemo::AddNetworkPanel() {
 void ControllerDiagnosticDemo::InitializeNetworkStreaming() {
     ShutdownNetworkStreaming();
     LoadNetworkPreferences();
+    SetDashboardVisible(true);
 
     const LanInterfaceInfo interface_info = QueryLanInterface();
     std::string scan_status = interface_info.valid ? "接口就绪" : "未找到可用 IPv4 局域网接口";
@@ -1726,6 +1777,8 @@ void ControllerDiagnosticDemo::ShutdownNetworkStreaming() {
     if (socket_fd >= 0) {
         close(socket_fd);
     }
+
+    SetDashboardVisible(true);
 }
 
 void ControllerDiagnosticDemo::StartLanScan() {
@@ -2115,6 +2168,7 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
     bool udp_enabled = false;
     bool scan_in_progress = false;
     uint16_t udp_port = 0;
+    int send_rate_hz = 200;
     int selected_target_index = 0;
     uint64_t packet_sequence = 0;
     std::string scan_status;
@@ -2125,6 +2179,7 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
         udp_enabled = network_state_.udp_enabled;
         scan_in_progress = network_state_.scan_in_progress;
         udp_port = network_state_.udp_port;
+        send_rate_hz = network_state_.send_rate_hz;
         selected_target_index = network_state_.selected_target_index;
         packet_sequence = network_state_.packet_sequence;
         scan_status = network_state_.scan_status;
@@ -2146,6 +2201,7 @@ std::string ControllerDiagnosticDemo::BuildNetworkPanelText() {
            << "\n";
     stream << "广播地址  " << (interface_info.valid ? interface_info.broadcast_ip : "无") << "\n";
     stream << "端口  " << udp_port << "\n";
+    stream << "频率  " << send_rate_hz << " Hz\n";
     stream << "目标  " << selected_target << "\n";
     stream << "扫描状态  " << (scan_in_progress ? "扫描中" : scan_status) << "\n";
     stream << "已发包  " << packet_sequence << "\n";
@@ -2168,15 +2224,18 @@ void ControllerDiagnosticDemo::UpdateNetworkStreaming() {
     const auto now = std::chrono::steady_clock::now();
     uint64_t sequence_to_send = 0;
     bool should_send = false;
+    int send_rate_hz = 200;
     {
         std::lock_guard<std::mutex> lock(network_state_.device_mutex);
         if (!network_state_.interface_info.valid) {
             return;
         }
 
+        send_rate_hz = network_state_.send_rate_hz;
+        const int send_interval_ms = std::max(1, 1000 / std::max(1, send_rate_hz));
         const bool send_due = network_state_.udp_enabled &&
                               (network_state_.packet_sequence == 0 ||
-                               now - network_state_.last_send_time >= std::chrono::milliseconds(50));
+                               now - network_state_.last_send_time >= std::chrono::milliseconds(send_interval_ms));
         if (network_state_.send_snapshot_requested || send_due) {
             network_state_.send_snapshot_requested = false;
             network_state_.last_send_time = now;
@@ -2487,50 +2546,26 @@ void ControllerDiagnosticDemo::DetectInputEvents() {
             {kTouchX, "X"},                       {kTouchY, "Y"},
             {kTouchA, "A"},                       {kTouchB, "B"}};
 
-    constexpr auto kLongPressThreshold = std::chrono::milliseconds(400);
+    constexpr auto kShortPressThreshold = std::chrono::milliseconds(250);
+    constexpr auto kLongPressThreshold = std::chrono::milliseconds(650);
     const auto now = std::chrono::steady_clock::now();
 
-    auto toggle_udp = [this]() {
-        ToggleUdpSending();
-    };
-
-    // X key (left controller): short press toggles UDP, long press calibrates left hand
-    if ((button_down & kButtonX) != 0) {
-        x_press_time_ = now;
-        x_long_triggered_ = false;
-    }
-    if ((button_up & kButtonX) != 0) {
-        if (!x_long_triggered_) {
-            auto duration = now - x_press_time_;
-            if (duration < kLongPressThreshold) {
-                toggle_udp();
-            }
-        }
-    }
-    if ((buttons & kButtonX) != 0 && !x_long_triggered_) {
-        if (now - x_press_time_ >= kLongPressThreshold) {
-            x_long_triggered_ = true;
-            ResetHandZeroPoint(Side::LEFT);
-        }
-    }
-
-    // A key (right controller): short press toggles UDP, long press calibrates right hand
+    // A key (right controller): short press toggles UDP sending, long press resets both hands zero point
     if ((button_down & kButtonA) != 0) {
         a_press_time_ = now;
         a_long_triggered_ = false;
     }
-    if ((button_up & kButtonA) != 0) {
-        if (!a_long_triggered_) {
-            auto duration = now - a_press_time_;
-            if (duration < kLongPressThreshold) {
-                toggle_udp();
-            }
+    if ((button_up & kButtonA) != 0 && !a_long_triggered_) {
+        const auto duration = now - a_press_time_;
+        if (duration <= kShortPressThreshold) {
+            ToggleUdpSending();
         }
     }
     if ((buttons & kButtonA) != 0 && !a_long_triggered_) {
         if (now - a_press_time_ >= kLongPressThreshold) {
             a_long_triggered_ = true;
-            ResetHandZeroPoint(Side::RIGHT);
+            ResetBothHandsForSending();
+            last_ui_event_ = "已通过长按 A 重置左右手零点";
         }
     }
 
